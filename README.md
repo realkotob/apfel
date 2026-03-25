@@ -91,6 +91,16 @@ Uninstall:
 make uninstall
 ```
 
+## Screenshots
+
+### CLI
+
+![apfel CLI](screenshots/cli.png)
+
+### GUI Debug Inspector
+
+![apfel GUI](screenshots/gui-chat.png)
+
 ## Quick Start
 
 ### CLI
