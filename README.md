@@ -92,7 +92,16 @@ apfel --chat
 apfel --chat -s "You are a helpful coding assistant"
 ```
 
-Context window is managed automatically - oldest messages rotate out when the 4096-token limit approaches.
+Context window is managed automatically with configurable strategies:
+
+```bash
+apfel --chat --context-strategy newest-first     # default: keep recent turns
+apfel --chat --context-strategy oldest-first     # keep earliest turns
+apfel --chat --context-strategy sliding-window --context-max-turns 6
+apfel --chat --context-strategy summarize        # compress old turns via on-device model
+apfel --chat --context-strategy strict           # error on overflow, no trimming
+apfel --chat --context-output-reserve 256        # custom output token reserve
+```
 
 ### Debug GUI
 
@@ -154,6 +163,7 @@ Also in `demo/`:
 | `temperature`, `max_tokens`, `seed` | Supported | Mapped to `GenerationOptions` |
 | `stream: true` | Supported | SSE with usage stats in final chunk |
 | `finish_reason` | Supported | `stop`, `tool_calls`, `length` |
+| Context strategies | Supported | `x_context_strategy`, `x_context_max_turns`, `x_context_output_reserve` extension fields |
 | CORS | Supported | Enable with `--cors` |
 | `POST /v1/completions` | 501 | Legacy text completions not supported |
 | `POST /v1/embeddings` | 501 | Embeddings not available on-device |
@@ -184,6 +194,7 @@ apfel --stream <prompt>        Stream response tokens
 apfel --serve                  Start OpenAI-compatible server
 apfel --gui                    Launch debug GUI
 apfel --model-info             Print model capabilities
+apfel --release                Show detailed release and build info
 ```
 
 | Flag | Description |
@@ -197,6 +208,10 @@ apfel --model-info             Print model capabilities
 | `--seed <n>` | Random seed for reproducibility |
 | `--max-tokens <n>` | Maximum response tokens |
 | `--permissive` | Use permissive guardrails |
+| `--context-strategy <s>` | Context strategy: `newest-first` (default), `oldest-first`, `sliding-window`, `summarize`, `strict` |
+| `--context-max-turns <n>` | Max history turns (sliding-window only) |
+| `--context-output-reserve <n>` | Tokens reserved for output (default: 512) |
+| `--release` | Show detailed version, build, and capability info |
 | `--port <n>` | Server port (default: 11434) |
 | `--host <addr>` | Server bind address (default: 127.0.0.1) |
 | `--cors` | Enable CORS headers |
@@ -223,6 +238,9 @@ apfel --model-info             Print model capabilities
 | `APFEL_PORT` | Server port |
 | `APFEL_TEMPERATURE` | Default temperature |
 | `APFEL_MAX_TOKENS` | Default max tokens |
+| `APFEL_CONTEXT_STRATEGY` | Default context strategy |
+| `APFEL_CONTEXT_MAX_TURNS` | Max turns for sliding-window |
+| `APFEL_CONTEXT_OUTPUT_RESERVE` | Tokens reserved for output |
 | `NO_COLOR` | Disable colors ([no-color.org](https://no-color.org)) |
 
 ## Architecture
@@ -240,15 +258,20 @@ GUI (SwiftUI) ─── HTTP ────┘   ContextManager → Transcript API
 Built with Swift 6.3 strict concurrency. Single `Package.swift`, three targets:
 - `ApfelCore` - pure logic library (no FoundationModels dependency, unit-testable)
 - `apfel` - executable (CLI + server + GUI)
-- `apfel-tests` - 28 unit tests
+- `apfel-tests` - 48 unit tests
+
+No Xcode required - builds with Command Line Tools only.
 
 ## Build & Test
 
 ```bash
+make install                             # release build + install to /usr/local/bin
 swift build                              # debug build
-swift run apfel-tests                    # pure Swift unit tests
-bash Tests/integration/run_tests.sh      # release-binary integration tests
+swift run apfel-tests                    # 48 pure Swift unit tests
+python3 -m pytest Tests/integration/ -v  # 51 integration tests (requires server running)
 ```
+
+`make install` auto-generates build metadata (commit, date, Swift version) embedded in the binary. View with `apfel --release`.
 
 ## Examples
 

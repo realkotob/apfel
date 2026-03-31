@@ -223,6 +223,36 @@ func printModelInfo() async {
     """)
 }
 
+// MARK: - Release Info
+
+func printRelease() {
+    print("""
+    \(styled(appName, .cyan, .bold)) v\(version) — release info
+
+    \(styled("VERSION:", .yellow, .bold))
+    \(styled("├", .dim)) version:    \(version)
+    \(styled("├", .dim)) commit:     \(buildCommit)
+    \(styled("├", .dim)) branch:     \(buildBranch)
+    \(styled("├", .dim)) built:      \(buildDate)
+    \(styled("├", .dim)) swift:      \(buildSwiftVersion)
+    \(styled("└", .dim)) os:         \(buildOS)
+
+    \(styled("CAPABILITIES:", .yellow, .bold))
+    \(styled("├", .dim)) on-device:  100% local inference (no cloud, no API keys)
+    \(styled("├", .dim)) model:      \(modelName) (FoundationModels framework)
+    \(styled("├", .dim)) context:    4096 tokens
+    \(styled("├", .dim)) modes:      single, stream, chat, serve, gui
+    \(styled("├", .dim)) server:     OpenAI-compatible (/v1/chat/completions)
+    \(styled("├", .dim)) tools:      function calling via JSON schema
+    \(styled("├", .dim)) formats:    plain, json, streaming SSE
+    \(styled("└", .dim)) strategies: newest-first, oldest-first, sliding-window, summarize, strict
+
+    \(styled("LINKS:", .yellow, .bold))
+    \(styled("├", .dim)) repo:       https://github.com/Arthur-Ficial/apfel
+    \(styled("└", .dim)) requires:   macOS 26+, Apple Silicon, Apple Intelligence enabled
+    """)
+}
+
 // MARK: - Usage
 
 /// Print the help text. Styled with ANSI colors when on a TTY.
@@ -249,6 +279,7 @@ func printUsage() {
           --model-info           Print model capabilities and exit
       -h, --help                Show this help
       -v, --version             Print version
+          --release             Show detailed release and build info
 
     \(styled("CONTEXT OPTIONS:", .yellow, .bold))
           --context-strategy <s>  Context management strategy [default: newest-first]

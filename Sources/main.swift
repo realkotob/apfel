@@ -100,6 +100,10 @@ while i < args.count {
         print("\(appName) v\(version)")
         exit(exitSuccess)
 
+    case "--release":
+        printRelease()
+        exit(exitSuccess)
+
     case "-s", "--system":
         i += 1
         guard i < args.count else {
