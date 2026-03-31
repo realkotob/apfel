@@ -226,6 +226,8 @@ apfel --model-info             Print model capabilities
 apfel --release                Show detailed release and build info
 ```
 
+**General options** (all modes):
+
 | Flag | Description |
 |------|-------------|
 | `-s, --system <text>` | System prompt |
@@ -237,22 +239,28 @@ apfel --release                Show detailed release and build info
 | `--seed <n>` | Random seed for reproducibility |
 | `--max-tokens <n>` | Maximum response tokens |
 | `--permissive` | Use permissive content guardrails |
-| `--context-strategy <s>` | Context strategy: `newest-first` (default), `oldest-first`, `sliding-window`, `summarize`, `strict` |
-| `--context-max-turns <n>` | Max history turns (sliding-window only) |
-| `--context-output-reserve <n>` | Tokens reserved for output (default: 512) |
-| `--chat` | Interactive multi-turn conversation |
-| `--stream` | Stream response tokens |
-| `--serve` | Start OpenAI-compatible HTTP server |
-| `--gui` | Launch native SwiftUI debug inspector |
-| `--port <n>` | Server port (default: 11434) |
-| `--host <addr>` | Server bind address (default: 127.0.0.1) |
-| `--cors` | Enable CORS headers for browser clients |
-| `--max-concurrent <n>` | Max concurrent requests (default: 5) |
-| `--debug` | Verbose server logging |
 | `--model-info` | Print model capabilities and exit |
 | `--release` | Show detailed version, build, and capability info |
 | `-v, --version` | Print version |
 | `-h, --help` | Show help |
+
+**Context options** (`--chat`):
+
+| Flag | Description |
+|------|-------------|
+| `--context-strategy <s>` | `newest-first` (default), `oldest-first`, `sliding-window`, `summarize`, `strict` |
+| `--context-max-turns <n>` | Max history turns (`sliding-window` only) |
+| `--context-output-reserve <n>` | Tokens reserved for output (default: 512) |
+
+**Server options** (`--serve`):
+
+| Flag | Description |
+|------|-------------|
+| `--port <n>` | Server port (default: 11434) |
+| `--host <addr>` | Bind address (default: 127.0.0.1) |
+| `--cors` | Enable CORS headers for browser clients |
+| `--max-concurrent <n>` | Max concurrent requests (default: 5) |
+| `--debug` | Verbose logging |
 
 ### Exit Codes
 
