@@ -260,20 +260,16 @@ Also in `demo/`:
 
 ### Debug GUI
 
-**[apfel-gui](https://github.com/Arthur-Ficial/apfel-gui)** - native macOS SwiftUI debug app that talks to `apfel --serve` via HTTP. Shows everything: raw HTTP requests/responses, full MCP JSON-RPC protocol data, server event traces, token budgets, SSE streams.
-
-![apfel GUI](screenshots/gui-chat.png)
-
 ```bash
-brew install Arthur-Ficial/tap/apfel-gui   # installs apfel as a dependency
+brew install Arthur-Ficial/tap/apfel-gui
 apfel-gui
 ```
 
-On launch it starts `apfel --serve` in the background with MCP tool servers, waits for the health check, and opens the debug window. Quitting the app stops the server.
+![apfel GUI](screenshots/gui-chat.png)
 
-**Debug inspector timeline:** server launch command, HTTP request body, chronological server event trace (context build, MCP tool execution, finish reason), raw MCP JSON-RPC request/response, timing and token breakdown, copy-paste curl and CLI commands to reproduce.
+Native macOS SwiftUI app for debugging and chatting with Apple Intelligence. Debug inspector with full request/response timeline, MCP JSON-RPC protocol viewer, live request logs, model settings, speech-to-text, text-to-speech - all on-device.
 
-**Also:** chat with streaming, model settings (temperature, max tokens, seed, JSON mode), context strategy picker, live request log with stats, speech-to-text, text-to-speech, self-discussion mode - all on-device. See the [apfel-gui repo](https://github.com/Arthur-Ficial/apfel-gui) for details.
+**[Full documentation and features in the apfel-gui repo ->](https://github.com/Arthur-Ficial/apfel-gui)**
 
 ## OpenAI API Compatibility
 
