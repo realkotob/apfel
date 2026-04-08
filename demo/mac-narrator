@@ -148,7 +148,7 @@ narrate() {
     if comment=$(apfel -q --max-tokens 150 -s "$PROMPT" "System snapshot: $oneline"); then
         echo -e "\033[90m[$(date +%H:%M:%S)]\033[0m $comment"
         if $SAY; then
-            say "$comment" &
+            say "$comment"
         fi
     else
         echo -e "\033[90m[$(date +%H:%M:%S)]\033[0m \033[33m(model busy, skipping)\033[0m"
