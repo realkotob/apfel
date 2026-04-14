@@ -42,10 +42,13 @@ For the operator-level guide - how prompts are version-controlled, how kill-swit
 
 | Phase | Routine | Status |
 |---|---|---|
-| 1 | PR auto-review | **Live** (see `.claude/routines/02-pr-auto-review.md`) |
-| 2 | Issue triage | Deferred until Phase 1 has 3 consecutive quality reviews |
-| 3 | Distribution-channel sync watch | Deferred until Phase 2 is stable |
+| 1 | PR auto-review | **Live** |
+| 2 | Issue triage | **Live** |
+| 3 | Distribution-channel sync watch | **Live** |
+| + | Bug solver (labels `bug` OR `@Arthur-Ficial investigate`) | **Live** - drafts a fix PR for real bugs |
 | - | Stale issue sweep, first-time CI approval as standalone, post-release verify | Not planned |
+
+All four routines share the same identity (Arthur Ficial voice - warm, short, specific) and the same hard guardrails. The full prompt texts are committed under [`.claude/routines/`](../.claude/routines/).
 
 ## Security note
 
