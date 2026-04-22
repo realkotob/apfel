@@ -20,7 +20,7 @@ Apple Silicon Macs ship a built-in LLM via [Apple FoundationModels](https://deve
 
 Tool calling works in both. 4096-token context.
 
-Try it right away: `apfel --chat` - a small interactive REPL for quick testing.
+Try it right away: `apfel --chat` - an interactive REPL.
 
 ![apfel CLI](screenshots/cli.png)
 
