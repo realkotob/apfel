@@ -73,9 +73,11 @@ func suite(_ name: String, _ block: () -> Void) {
 // MARK: - Run all test suites
 
 suite("ApfelErrorTests") { runApfelErrorTests() }
+suite("ExitCodeMapTests") { runExitCodeMapTests() }
 suite("ToolCallHandlerTests") { runToolCallHandlerTests() }
 suite("ContextStrategyTests") { runContextStrategyTests() }
 suite("OpenAIModelsTests") { runOpenAIModelsTests() }
+suite("JSONFenceStripperTests") { runJSONFenceStripperTests() }
 suite("ChatRequestValidatorTests") { runChatRequestValidatorTests() }
 suite("OriginValidatorTests") { runOriginValidatorTests() }
 suite("MCPClientTests") { runMCPClientTests() }
@@ -87,6 +89,21 @@ suite("CLIArgumentsTests") { runCLIArgumentsTests() }
 suite("ModelAvailabilityTests") { runModelAvailabilityTests() }
 suite("CLIErrorsTests") { runCLIErrorsTests() }
 suite("CLIValidateTests") { runCLIValidateTests() }
+suite("SchemaParserTests") { runSchemaParserTests() }
+suite("FinishReasonResolverTests") { runFinishReasonResolverTests() }
+suite("StreamErrorResolverTests") { runStreamErrorResolverTests() }
+suite("ToolResolutionTests") { runToolResolutionTests() }
+suite("BodyLimitsTests") { runBodyLimitsTests() }
+suite("CLIServerParityTests") { runCLIServerParityTests() }
+suite("TraceBufferTests") { runTraceBufferTests() }
+suite("StreamTaskBoxTests") { runStreamTaskBoxTests() }
+suite("ManPageTests") { runManPageTests() }
+suite("StreamCleanupTests") { runStreamCleanupTests() }
+suite("BufferedLineReaderConcurrencyTests") { runBufferedLineReaderConcurrencyTests() }
+suite("DebugFlagBaselineTests") { runDebugFlagBaselineTests() }
+suite("ApfelErrorMessageTests") { runApfelErrorMessageTests() }
+suite("OpenAIWireFormatTests") { runOpenAIWireFormatTests() }
+suite("ApfelCorePublicAPIUsageTests") { runApfelCorePublicAPIUsageTests() }
 
 // MARK: - Summary
 

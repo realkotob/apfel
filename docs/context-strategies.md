@@ -19,7 +19,7 @@ apfel --chat --context-output-reserve 256        # custom output token reserve
 | `oldest-first` | Earliest turns. New turns are dropped when the window fills. | Instructions or context at the start of a session that must never fall out. |
 | `sliding-window` | A rolling window of the last N turns (`--context-max-turns N`). | Predictable memory usage, simple last-N-turns semantics. |
 | `summarize` | Old turns compressed into a short summary by the on-device model, then appended as context. | Long sessions where you want continuity without losing old content entirely. Costs one extra on-device inference per rotation. |
-| `strict` | Everything. Errors with `contextOverflow` when the window fills. | CI, scripts, batch pipelines — fail loud instead of silently dropping content. |
+| `strict` | Everything. Errors with `contextOverflow` when the window fills. | CI, scripts, batch pipelines - fail loud instead of silently dropping content. |
 
 ## Output token reserve
 
@@ -29,8 +29,8 @@ apfel --chat --context-output-reserve 256        # custom output token reserve
 
 All four settings have env var equivalents:
 
-- `APFEL_CONTEXT_STRATEGY` — one of `newest-first`, `oldest-first`, `sliding-window`, `summarize`, `strict`
-- `APFEL_CONTEXT_MAX_TURNS` — positive integer for sliding-window
-- `APFEL_CONTEXT_OUTPUT_RESERVE` — positive integer, tokens reserved for output
+- `APFEL_CONTEXT_STRATEGY` - one of `newest-first`, `oldest-first`, `sliding-window`, `summarize`, `strict`
+- `APFEL_CONTEXT_MAX_TURNS` - positive integer for sliding-window
+- `APFEL_CONTEXT_OUTPUT_RESERVE` - positive integer, tokens reserved for output
 
 CLI flags always override env vars.

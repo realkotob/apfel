@@ -61,15 +61,15 @@ META
 ## Examples By Flag
 
 ```bash
-# -f, --file — attach file content to prompt (repeatable)
+# -f, --file - attach file content to prompt (repeatable)
 apfel -f main.swift "Explain this code"
 apfel -f before.txt -f after.txt "What changed?"
 
-# -s, --system — set a system prompt
+# -s, --system - set a system prompt
 apfel -s "You are a pirate" "What is recursion?"
 apfel -s "Reply in JSON only" "List 3 colors"
 
-# --system-file — read system prompt from a file
+# --system-file - read system prompt from a file
 apfel --system-file persona.txt "Introduce yourself"
 
 # --mcp, --mcp-token, --mcp-timeout
@@ -177,7 +177,7 @@ Security details live in [server-security.md](server-security.md). Background-se
 | `APFEL_CONTEXT_STRATEGY` | Default context strategy |
 | `APFEL_CONTEXT_MAX_TURNS` | Max turns for sliding-window |
 | `APFEL_CONTEXT_OUTPUT_RESERVE` | Tokens reserved for output |
-| `APFEL_MCP` | MCP server paths — colon-separated for local paths, comma-separated for mixed local+remote URLs |
+| `APFEL_MCP` | MCP server paths - colon-separated for local paths, comma-separated for mixed local+remote URLs |
 | `APFEL_MCP_TOKEN` | Bearer token for remote HTTP MCP servers (preferred over `--mcp-token`; not visible in `ps aux`) |
 | `APFEL_MCP_TIMEOUT` | MCP timeout in seconds (default: 5, max: 300) |
 | `NO_COLOR` | Disable colors ([https://no-color.org](https://no-color.org)) |

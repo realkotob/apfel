@@ -1,14 +1,6 @@
 import Foundation
 import ApfelCore
 
-// Test helper: simulate FoundationModels GenerationError by name
-private struct GenErrSim: Error, LocalizedError, CustomStringConvertible {
-    let caseName: String
-    let localizedMsg: String
-    var errorDescription: String? { localizedMsg }
-    var description: String { "GenerationError.\(caseName)(Context(debugDescription: \"\(localizedMsg)\"))" }
-}
-
 func runApfelErrorTests() {
     test("guardrail keyword → .guardrailViolation") {
         let err = NSError(domain: "FM", code: 0,
@@ -84,12 +76,144 @@ func runApfelErrorTests() {
         try assertEqual(ApfelError.classify(ApfelError.guardrailViolation), .guardrailViolation)
         try assertEqual(ApfelError.classify(ApfelError.rateLimited), .rateLimited)
         try assertEqual(ApfelError.classify(ApfelError.concurrentRequest), .concurrentRequest)
+        try assertEqual(ApfelError.classify(ApfelError.assetsUnavailable), .assetsUnavailable)
+        try assertEqual(ApfelError.classify(ApfelError.refusal("r")), .refusal("r"))
         try assertEqual(ApfelError.classify(ApfelError.toolExecution("x")), .toolExecution("x"))
     }
+    test("classify maps every known FoundationModels GenerationError case") {
+        let localized = "localized details"
+        let cases: [(caseName: String, expected: ApfelError)] = [
+            ("exceededContextWindowSize", .contextOverflow),
+            ("assetsUnavailable", .assetsUnavailable),
+            ("guardrailViolation", .guardrailViolation),
+            ("unsupportedGuide", .unsupportedGuide),
+            ("unsupportedLanguageOrLocale", .unsupportedLanguage(localized)),
+            ("decodingFailure", .decodingFailure(localized)),
+            ("rateLimited", .rateLimited),
+            ("concurrentRequests", .concurrentRequest),
+            ("refusal", .refusal(localized)),
+        ]
+
+        for item in cases {
+            let err = FoundationModelsGenerationErrorStub(caseName: item.caseName, localizedMsg: localized)
+            try assertEqual(ApfelError.classify(err), item.expected, "case=\(item.caseName)")
+        }
+    }
+    test("classify preserves refusal explanation text, distinct from guardrailViolation") {
+        let refusal = FoundationModelsGenerationErrorStub(
+            caseName: "refusal",
+            localizedMsg: "I cannot provide that information."
+        )
+        let classified = ApfelError.classify(refusal)
+        if case .refusal(let text) = classified {
+            try assertEqual(text, "I cannot provide that information.")
+        } else {
+            throw TestFailure("expected .refusal, got \(classified)")
+        }
+        // And guardrailViolation stays distinct
+        let guardrail = FoundationModelsGenerationErrorStub(
+            caseName: "guardrailViolation",
+            localizedMsg: "Blocked by safety policy"
+        )
+        try assertEqual(ApfelError.classify(guardrail), .guardrailViolation)
+    }
+    test("classify string fallback detects refusal keywords") {
+        for keyword in ["refused", "refusal", "declined"] {
+            let err = NSError(domain: "FM", code: 0,
+                userInfo: [NSLocalizedDescriptionKey: "The model \(keyword) to respond"])
+            if case .refusal = ApfelError.classify(err) {
+                continue
+            }
+            throw TestFailure("expected .refusal for keyword '\(keyword)'")
+        }
+    }
+    test("classify passthrough for refusal") {
+        let original = ApfelError.refusal("preserve me")
+        try assertEqual(ApfelError.classify(original), .refusal("preserve me"))
+    }
+    test("refusal error properties") {
+        // Per OpenAI wire format, an output-side refusal is a successful
+        // completion (HTTP 200) with finish_reason=content_filter and the
+        // refusal text populated on the assistant message. CLI semantics
+        // remain separate: the CLI still exits with the guardrail code (3).
+        let err = ApfelError.refusal("Model says no")
+        try assertEqual(err.cliLabel, "[refusal]")
+        try assertEqual(err.openAIType, "content_policy_violation")
+        try assertEqual(err.httpStatusCode, 200)
+        try assertTrue(err.openAIMessage.contains("Model says no"))
+        try assertTrue(!err.isRetryable)
+    }
+    test("refusal Equatable: same text equal, different text unequal, distinct from guardrailViolation") {
+        try assertEqual(ApfelError.refusal("a"), ApfelError.refusal("a"))
+        try assertTrue(ApfelError.refusal("a") != ApfelError.refusal("b"))
+        try assertTrue(ApfelError.refusal("") != ApfelError.guardrailViolation)
+        try assertTrue(ApfelError.refusal("text") != ApfelError.unknown("text"))
+    }
+    test("refusal Hashable: round-trips through Set with associated text") {
+        let set: Set<ApfelError> = [
+            .refusal("one"),
+            .refusal("two"),
+            .refusal("one"),            // dupe of the first
+            .guardrailViolation,
+        ]
+        try assertEqual(set.count, 3, "duplicate refusal('one') must collapse, guardrailViolation stays distinct")
+        try assertTrue(set.contains(.refusal("one")))
+        try assertTrue(set.contains(.refusal("two")))
+        try assertTrue(set.contains(.guardrailViolation))
+        try assertTrue(!set.contains(.refusal("three")))
+    }
+    test("refusal debugDescription is a stable, reflective format") {
+        try assertEqual(
+            ApfelError.refusal("I cannot help with that.").debugDescription,
+            #"ApfelError.refusal("I cannot help with that.")"#
+        )
+        // Internal quotes in the explanation must be escaped by String(reflecting:).
+        try assertEqual(
+            ApfelError.refusal(#"he said "no""#).debugDescription,
+            #"ApfelError.refusal("he said \"no\"")"#
+        )
+    }
+    test("refusal with empty explanation still produces a non-empty openAIMessage") {
+        let empty = ApfelError.refusal("")
+        try assertTrue(!empty.openAIMessage.isEmpty, "empty refusal must not produce empty message")
+        try assertEqual(empty.openAIMessage, "The on-device model refused the request: ")
+        try assertEqual(empty.cliLabel, "[refusal]")
+    }
+    test("refusal localizedDescription equals openAIMessage for non-trivial text") {
+        let err = ApfelError.refusal("multi-sentence reason. Another clause.")
+        try assertEqual((err as Error).localizedDescription, err.openAIMessage)
+    }
+    // Locale-independence of the typed refusal classification path.
+    // The mirror string contains "refusal" regardless of the user's locale;
+    // localizedMsg is rendered by Apple in whatever language the system is set to.
+    // Each case must still classify as .refusal with the localized text preserved.
+    let refusalLocaleFixtures: [(lang: String, localizedMsg: String)] = [
+        ("en", "The model refused to answer."),
+        ("de", "Das Modell hat die Antwort verweigert."),
+        ("fr", "Le modele a refuse de repondre."),
+        ("ja", "モデルは回答を拒否しました。"),
+        ("zh", "模型拒绝回答。"),
+    ]
+    for fixture in refusalLocaleFixtures {
+        test("refusal is detected and explanation preserved on \(fixture.lang) locale") {
+            let err = FoundationModelsGenerationErrorStub(
+                caseName: "refusal",
+                localizedMsg: fixture.localizedMsg
+            )
+            let classified = ApfelError.classify(err)
+            if case .refusal(let text) = classified {
+                try assertEqual(text, fixture.localizedMsg, "locale=\(fixture.lang)")
+            } else {
+                throw TestFailure("expected .refusal on \(fixture.lang), got \(classified)")
+            }
+        }
+    }
     test("openAIMessage is non-empty for all cases") {
-        let cases: [ApfelError] = [.guardrailViolation, .contextOverflow, .rateLimited,
-                                    .concurrentRequest, .toolExecution("tool failed"), .unknown("oops"),
-                                    .unsupportedGuide, .decodingFailure("decode failed")]
+        let cases: [ApfelError] = [.guardrailViolation, .refusal("text"), .contextOverflow,
+                                    .rateLimited, .concurrentRequest, .assetsUnavailable,
+                                    .toolExecution("tool failed"), .unknown("oops"),
+                                    .unsupportedGuide, .decodingFailure("decode failed"),
+                                    .unsupportedLanguage("Klingon")]
         for c in cases {
             try assertTrue(!c.openAIMessage.isEmpty, "\(c)")
         }
@@ -149,7 +273,10 @@ func runApfelErrorTests() {
         try assertTrue(!err.isRetryable)
     }
     test("classify detects GenerationError.unsupportedGuide") {
-        let err = GenErrSim(caseName: "unsupportedGuide", localizedMsg: "Nicht unterstuetzte Anleitung")
+        let err = FoundationModelsGenerationErrorStub(
+            caseName: "unsupportedGuide",
+            localizedMsg: "Nicht unterstuetzte Anleitung"
+        )
         try assertEqual(ApfelError.classify(err), .unsupportedGuide)
     }
     test("classify passthrough for unsupportedGuide") {
@@ -167,7 +294,10 @@ func runApfelErrorTests() {
         try assertTrue(!err.isRetryable)
     }
     test("classify detects GenerationError.decodingFailure") {
-        let err = GenErrSim(caseName: "decodingFailure", localizedMsg: "Dekodierungsfehler")
+        let err = FoundationModelsGenerationErrorStub(
+            caseName: "decodingFailure",
+            localizedMsg: "Dekodierungsfehler"
+        )
         if case .decodingFailure = ApfelError.classify(err) { } else {
             throw TestFailure("expected .decodingFailure")
         }

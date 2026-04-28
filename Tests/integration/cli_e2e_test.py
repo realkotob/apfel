@@ -601,6 +601,70 @@ def test_file_flag_with_stdin_and_prompt():
         tmp.unlink(missing_ok=True)
 
 
+# --- Stdin + --stream tests (GH-82) ---
+
+
+def test_stdin_with_stream_flag():
+    """Piped stdin + --stream + prompt should combine (GH-82)."""
+    require_model()
+    result = run_cli(
+        ["-q", "-o", "json", "--stream",
+         "What city is mentioned above? Reply with just the city name."],
+        input_text="The capital of France is Paris.",
+        timeout=90,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    assert "paris" in payload["content"].lower()
+
+
+def test_stdin_only_with_stream_flag():
+    """Piped stdin as sole prompt with --stream (GH-82)."""
+    require_model()
+    result = run_cli(
+        ["-q", "-o", "json", "--stream"],
+        input_text="What is 2+2? Reply with just the number.",
+        timeout=90,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    assert payload["content"].strip()
+
+
+def test_file_flag_with_stdin_and_stream():
+    """apfel -f <file> --stream <prompt> with piped stdin should include all three (GH-82)."""
+    require_model()
+    tmp = pathlib.Path("/tmp/apfel_test_file_stdin_stream.txt")
+    tmp.write_text("File content: The answer is 42.")
+    try:
+        result = run_cli(
+            ["-q", "-o", "json", "-f", str(tmp), "--stream",
+             "What number is mentioned? Reply with just the number."],
+            input_text="Stdin content: ignore this.",
+            timeout=90,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        payload = json.loads(result.stdout)
+        assert "42" in payload["content"]
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def test_stdin_stream_with_system_prompt():
+    """Piped stdin + --stream + system prompt should all combine (GH-82)."""
+    require_model()
+    result = run_cli(
+        ["-q", "-o", "json", "--stream",
+         "-s", "You are a helpful assistant. Always reply in uppercase.",
+         "What city is mentioned?"],
+        input_text="The capital of France is Paris.",
+        timeout=90,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    payload = json.loads(result.stdout)
+    assert "paris" in payload["content"].lower() or "PARIS" in payload["content"]
+
+
 # --- Self-update tests (--update) ---
 
 
@@ -711,7 +775,10 @@ MCP_CALC = str(ROOT / "mcp" / "calculator" / "server.py")
 def test_mcp_tool_info_goes_to_stderr():
     """MCP discovery and tool call info must go to stderr, not stdout."""
     require_model()
-    result = run_cli(["--mcp", MCP_CALC, "What is 2 + 2?"], timeout=30)
+    # max_tokens defaults to "use the rest of the window" -- the small
+    # on-device model can ramble before/after the tool call, so MCP test
+    # timeouts are sized to the worst case rather than to a fixed cap.
+    result = run_cli(["--mcp", MCP_CALC, "What is 2 + 2?"], timeout=120)
     assert result.returncode == 0
     assert "mcp:" not in result.stdout, \
         f"mcp: discovery line leaked to stdout: {result.stdout[:200]}"
@@ -724,7 +791,7 @@ def test_mcp_tool_info_goes_to_stderr():
 def test_mcp_stdout_only_has_answer():
     """When piping, stdout must contain only the model's answer."""
     require_model()
-    result = run_cli(["--mcp", MCP_CALC, "Use the add tool to add 10 and 20. Reply with just the number."], timeout=30)
+    result = run_cli(["--mcp", MCP_CALC, "Use the add tool to add 10 and 20. Reply with just the number."], timeout=120)
     assert result.returncode == 0
     stdout_stripped = result.stdout.strip()
     assert "mcp:" not in stdout_stripped
@@ -735,7 +802,7 @@ def test_mcp_stdout_only_has_answer():
 def test_mcp_quiet_suppresses_tool_info():
     """--quiet must suppress both mcp: and tool: lines on stderr."""
     require_model()
-    result = run_cli(["-q", "--mcp", MCP_CALC, "What is 3 times 3?"], timeout=30)
+    result = run_cli(["-q", "--mcp", MCP_CALC, "What is 3 times 3?"], timeout=120)
     assert result.returncode == 0
     assert "mcp:" not in result.stderr, \
         f"mcp: discovery line not suppressed by -q: {result.stderr[:200]}"
@@ -746,7 +813,7 @@ def test_mcp_quiet_suppresses_tool_info():
 def test_mcp_json_output_is_clean():
     """JSON output must not contain MCP diagnostic lines."""
     require_model()
-    result = run_cli(["-o", "json", "--mcp", MCP_CALC, "What is 5 plus 5?"], timeout=30)
+    result = run_cli(["-o", "json", "--mcp", MCP_CALC, "What is 5 plus 5?"], timeout=120)
     assert result.returncode == 0
     import json
     data = json.loads(result.stdout.strip())
@@ -879,5 +946,5 @@ def test_mcp_timeout_default_unchanged():
     """Default MCP timeout (5s) should still work for normal fast servers."""
     require_model()
     mcp_path = str(ROOT / "mcp" / "calculator" / "server.py")
-    result = run_cli(["--mcp", mcp_path, "What is 1+1?"], timeout=30)
+    result = run_cli(["--mcp", mcp_path, "What is 1+1?"], timeout=120)
     assert result.returncode == 0, f"Normal MCP should work with default timeout: {result.stderr}"

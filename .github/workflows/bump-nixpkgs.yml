@@ -1,0 +1,142 @@
+name: Bump nixpkgs apfel-ai
+
+# Fires when `make release` publishes a new GitHub Release. The workflow
+# forks/pulls NixOS/nixpkgs, runs scripts/bump-nixpkgs.sh to update
+# version + hash in pkgs/by-name/ap/apfel-ai/package.nix, and opens a
+# bump PR against nixpkgs master.
+#
+# This is our Layer 2 fallback -- the community r-ryantm bot usually
+# opens the same PR within a week. This workflow closes that window.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to bump nixpkgs to (without leading v)"
+        required: true
+        type: string
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # Skip if the NIXPKGS_BUMP_PAT secret is not yet configured. Lets the
+    # workflow file merge before the secret is set up, and lets the first
+    # few releases ship without failing CI.
+    if: ${{ github.repository == 'Arthur-Ficial/apfel' }}
+    steps:
+      - name: Check out apfel (for scripts/bump-nixpkgs.sh)
+        uses: actions/checkout@v6
+
+      - name: Determine target version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+            version="${tag#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Target version: $version"
+
+      - name: Require NIXPKGS_BUMP_PAT secret
+        env:
+          NIXPKGS_BUMP_PAT: ${{ secrets.NIXPKGS_BUMP_PAT }}
+        run: |
+          if [[ -z "$NIXPKGS_BUMP_PAT" ]]; then
+            echo "::warning::NIXPKGS_BUMP_PAT secret is not set - skipping nixpkgs bump."
+            echo "skip=1" >> "$GITHUB_ENV"
+          else
+            echo "skip=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check out Arthur-Ficial fork of nixpkgs
+        if: env.skip == '0'
+        uses: actions/checkout@v6
+        with:
+          repository: Arthur-Ficial/nixpkgs
+          token: ${{ secrets.NIXPKGS_BUMP_PAT }}
+          ref: master
+          path: nixpkgs
+          fetch-depth: 1
+
+      - name: Sync fork with upstream master
+        if: env.skip == '0'
+        working-directory: nixpkgs
+        run: |
+          git remote add upstream https://github.com/NixOS/nixpkgs.git
+          git fetch --depth=1 upstream master
+          git reset --hard upstream/master
+
+      - name: Run bump-nixpkgs.sh
+        if: env.skip == '0'
+        id: bump
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          bash ./scripts/bump-nixpkgs.sh \
+            --version "$VERSION" \
+            --file "nixpkgs/pkgs/by-name/ap/apfel-ai/package.nix"
+          # If git status shows no change, we're idempotent - bail early.
+          if git -C nixpkgs diff --quiet -- pkgs/by-name/ap/apfel-ai/package.nix; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push branch to fork
+        if: env.skip == '0' && steps.bump.outputs.changed == '1'
+        id: push
+        working-directory: nixpkgs
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.NIXPKGS_BUMP_PAT }}
+        run: |
+          git config user.name "Arthur Ficial"
+          git config user.email "arti.ficial@fullstackoptimization.com"
+          branch="apfel-ai-$VERSION"
+          git checkout -b "$branch"
+          git add pkgs/by-name/ap/apfel-ai/package.nix
+          git commit -m "apfel-ai: $VERSION"
+          git push --force origin "$branch"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR on NixOS/nixpkgs
+        if: env.skip == '0' && steps.bump.outputs.changed == '1'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BRANCH: ${{ steps.push.outputs.branch }}
+          GH_TOKEN: ${{ secrets.NIXPKGS_BUMP_PAT }}
+        run: |
+          # If a PR for this branch already exists, update it instead of creating a duplicate.
+          existing=$(gh pr list --repo NixOS/nixpkgs \
+            --head "Arthur-Ficial:$BRANCH" \
+            --state open \
+            --json number --jq '.[0].number // empty')
+          body=$(cat <<EOF
+          Automated version bump from the [apfel upstream release-trigger workflow](https://github.com/Arthur-Ficial/apfel/actions/workflows/bump-nixpkgs.yml).
+
+          - Release: https://github.com/Arthur-Ficial/apfel/releases/tag/v$VERSION
+          - Changelog: https://github.com/Arthur-Ficial/apfel/releases/tag/v$VERSION
+
+          ## Things done
+
+          - Built on platform:
+            - [ ] x86_64-linux
+            - [ ] aarch64-linux
+            - [ ] x86_64-darwin
+            - [x] aarch64-darwin (pre-built binary; verified with \`apfel --version\` on release)
+          - [x] Tested basic functionality.
+          EOF
+          )
+          if [[ -n "$existing" ]]; then
+            echo "Updating existing PR #$existing"
+          else
+            gh pr create --repo NixOS/nixpkgs \
+              --head "Arthur-Ficial:$BRANCH" \
+              --base master \
+              --title "apfel-ai: $VERSION" \
+              --body "$body"
+          fi

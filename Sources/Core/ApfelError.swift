@@ -1,7 +1,8 @@
 import Foundation
 
-public enum ApfelError: Error, Equatable, Sendable {
+public enum ApfelError: Error, Equatable, Hashable, Sendable {
     case guardrailViolation
+    case refusal(String)
     case contextOverflow
     case rateLimited
     case concurrentRequest
@@ -19,60 +20,64 @@ public enum ApfelError: Error, Equatable, Sendable {
         if let mcpError = error as? MCPError {
             return .toolExecution(mcpError.description)
         }
+        // FoundationModels ToolCallError is unreachable - apfel runs tools out-of-band; see #119
 
-        // Try typed match first (FoundationModels errors)
         let typeName = String(describing: type(of: error))
         let mirror = String(reflecting: error)
-        if typeName.contains("GenerationError") || mirror.contains("GenerationError") {
-            if mirror.contains("guardrailViolation") || mirror.contains("refusal") {
-                return .guardrailViolation
-            }
-            if mirror.contains("exceededContextWindowSize") {
-                return .contextOverflow
-            }
-            if mirror.contains("rateLimited") {
-                return .rateLimited
-            }
-            if mirror.contains("concurrentRequests") {
-                return .concurrentRequest
-            }
-            if mirror.contains("unsupportedLanguageOrLocale") {
-                return .unsupportedLanguage(error.localizedDescription)
-            }
-            if mirror.contains("assetsUnavailable") {
-                return .assetsUnavailable
-            }
-            if mirror.contains("unsupportedGuide") {
-                return .unsupportedGuide
-            }
-            if mirror.contains("decodingFailure") {
-                return .decodingFailure(error.localizedDescription)
-            }
+        if let generationError = classifyGenerationError(
+            typeName: typeName,
+            mirror: mirror,
+            localizedDescription: error.localizedDescription
+        ) {
+            return generationError
         }
 
-        // Fallback: string matching for unknown error types
-        let desc = error.localizedDescription.lowercased()
-        if desc.contains("guardrail") || desc.contains("content policy") || desc.contains("unsafe") {
+        return classifyLocalizedDescription(error.localizedDescription)
+    }
+
+    private static func classifyGenerationError(
+        typeName: String,
+        mirror: String,
+        localizedDescription: String
+    ) -> ApfelError? {
+        guard typeName.contains("GenerationError") || mirror.contains("GenerationError") else {
+            return nil
+        }
+
+        guard let generationCase = FoundationModelsGenerationErrorCase.firstMatch(in: mirror) else {
+            return nil
+        }
+
+        return generationCase.apfelError(localizedDescription: localizedDescription)
+    }
+
+    private static func classifyLocalizedDescription(_ description: String) -> ApfelError {
+        let desc = description.lowercased()
+        if desc.contains(anyOf: ["refused", "refusal", "declined"]) {
+            return .refusal(description)
+        }
+        if desc.contains(anyOf: ["guardrail", "content policy", "unsafe"]) {
             return .guardrailViolation
         }
-        if desc.contains("context window") || desc.contains("exceeded") {
+        if desc.contains(anyOf: ["context window", "exceeded"]) {
             return .contextOverflow
         }
-        if desc.contains("rate limit") || desc.contains("ratelimited") || desc.contains("rate_limit") {
+        if desc.contains(anyOf: ["rate limit", "ratelimited", "rate_limit"]) {
             return .rateLimited
         }
         if desc.contains("concurrent") {
             return .concurrentRequest
         }
         if desc.contains("unsupported language") {
-            return .unsupportedLanguage(error.localizedDescription)
+            return .unsupportedLanguage(description)
         }
-        return .unknown(error.localizedDescription)
+        return .unknown(description)
     }
 
     public var cliLabel: String {
         switch self {
         case .guardrailViolation:  return "[guardrail]"
+        case .refusal:             return "[refusal]"
         case .contextOverflow:     return "[context overflow]"
         case .rateLimited:         return "[rate limited]"
         case .concurrentRequest:   return "[busy]"
@@ -88,6 +93,7 @@ public enum ApfelError: Error, Equatable, Sendable {
     public var openAIType: String {
         switch self {
         case .guardrailViolation:  return "content_policy_violation"
+        case .refusal:             return "content_policy_violation"
         case .contextOverflow:     return "context_length_exceeded"
         case .rateLimited:         return "rate_limit_error"
         case .concurrentRequest:   return "rate_limit_error"
@@ -101,9 +107,15 @@ public enum ApfelError: Error, Equatable, Sendable {
     }
 
     /// HTTP status code for this error type.
+    ///
+    /// `.refusal` returns 200 because an output-side refusal is a successful
+    /// completion per the OpenAI wire format: HTTP 200 with
+    /// `finish_reason: "content_filter"` and the refusal text on the assistant
+    /// message. The CLI exit-code mapping stays separate (`ApfelExitCodes`).
     public var httpStatusCode: Int {
         switch self {
         case .guardrailViolation:  return 400
+        case .refusal:             return 200
         case .contextOverflow:     return 400
         case .rateLimited:         return 429
         case .concurrentRequest:   return 429
@@ -120,6 +132,8 @@ public enum ApfelError: Error, Equatable, Sendable {
         switch self {
         case .guardrailViolation:
             return "The request was blocked by Apple's safety guardrails. Try rephrasing."
+        case .refusal(let explanation):
+            return "The on-device model refused the request: \(explanation)"
         case .contextOverflow:
             return "Input exceeds the 4096-token context window. Shorten the conversation history."
         case .rateLimited:
@@ -149,6 +163,84 @@ public enum ApfelError: Error, Equatable, Sendable {
             return true
         default:
             return false
+        }
+    }
+}
+
+private enum FoundationModelsGenerationErrorCase: String, CaseIterable {
+    case guardrailViolation
+    case refusal
+    case exceededContextWindowSize
+    case rateLimited
+    case concurrentRequests
+    case unsupportedLanguageOrLocale
+    case assetsUnavailable
+    case unsupportedGuide
+    case decodingFailure
+
+    static func firstMatch(in mirror: String) -> FoundationModelsGenerationErrorCase? {
+        allCases.first { mirror.contains($0.rawValue) }
+    }
+
+    func apfelError(localizedDescription: String) -> ApfelError {
+        switch self {
+        case .guardrailViolation:
+            return .guardrailViolation
+        case .refusal:
+            return .refusal(localizedDescription)
+        case .exceededContextWindowSize:
+            return .contextOverflow
+        case .rateLimited:
+            return .rateLimited
+        case .concurrentRequests:
+            return .concurrentRequest
+        case .unsupportedLanguageOrLocale:
+            return .unsupportedLanguage(localizedDescription)
+        case .assetsUnavailable:
+            return .assetsUnavailable
+        case .unsupportedGuide:
+            return .unsupportedGuide
+        case .decodingFailure:
+            return .decodingFailure(localizedDescription)
+        }
+    }
+}
+
+private extension String {
+    func contains(anyOf needles: [String]) -> Bool {
+        needles.contains { contains($0) }
+    }
+}
+
+extension ApfelError: LocalizedError, CustomStringConvertible, CustomDebugStringConvertible {
+    public var errorDescription: String? { openAIMessage }
+
+    public var description: String { openAIMessage }
+
+    public var debugDescription: String {
+        switch self {
+        case .guardrailViolation:
+            return "ApfelError.guardrailViolation"
+        case .refusal(let message):
+            return "ApfelError.refusal(\(String(reflecting: message)))"
+        case .contextOverflow:
+            return "ApfelError.contextOverflow"
+        case .rateLimited:
+            return "ApfelError.rateLimited"
+        case .concurrentRequest:
+            return "ApfelError.concurrentRequest"
+        case .assetsUnavailable:
+            return "ApfelError.assetsUnavailable"
+        case .unsupportedGuide:
+            return "ApfelError.unsupportedGuide"
+        case .decodingFailure(let message):
+            return "ApfelError.decodingFailure(\(String(reflecting: message)))"
+        case .unsupportedLanguage(let message):
+            return "ApfelError.unsupportedLanguage(\(String(reflecting: message)))"
+        case .toolExecution(let message):
+            return "ApfelError.toolExecution(\(String(reflecting: message)))"
+        case .unknown(let message):
+            return "ApfelError.unknown(\(String(reflecting: message)))"
         }
     }
 }

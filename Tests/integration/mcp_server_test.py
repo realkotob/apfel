@@ -350,7 +350,12 @@ def test_mcp_tool_error_returns_structured_error():
 
 
 def test_mcp_tool_timeout_returns_structured_error():
-    """A hung MCP tool must fail fast with a structured timeout error."""
+    """A hung MCP tool must fail fast with a structured timeout error.
+
+    max_tokens is set explicitly so the test isolates MCP timeout behaviour
+    from the model-wandering latency that omitted max_tokens can introduce
+    on the small on-device model.
+    """
     with running_custom_mcp_server(FIXTURES / "hanging_mcp_server.py") as api_url:
         started = time.time()
         resp = httpx.post(f"{api_url}/chat/completions", json={
@@ -359,10 +364,11 @@ def test_mcp_tool_timeout_returns_structured_error():
                 {"role": "user", "content": "Use the multiply tool to compute 247 times 83. Reply with just the number."}
             ],
             "seed": 42,
-        }, timeout=10)
+            "max_tokens": 128,
+        }, timeout=30)
         elapsed = time.time() - started
 
-    assert elapsed < 8, f"Timed out too slowly: {elapsed:.2f}s"
+    assert elapsed < 25, f"Timed out too slowly: {elapsed:.2f}s"
     assert resp.status_code == 500
     data = resp.json()
     assert data["error"]["type"] == "server_error"
@@ -563,7 +569,10 @@ def test_mcp_invalid_json_rejected():
 # ============================================================================
 
 def test_json_mode_with_mcp():
-    """JSON mode still works when MCP tools are enabled."""
+    """JSON mode still works when MCP tools are enabled.
+
+    Per #101, json_object content must be directly parseable, no markdown fence.
+    """
     resp = httpx.post(f"{API_URL}/chat/completions", json={
         "model": MODEL,
         "messages": [
@@ -576,6 +585,9 @@ def test_json_mode_with_mcp():
     assert data["choices"][0]["finish_reason"] == "stop"
     content = data["choices"][0]["message"]["content"]
     assert content is not None
+    assert not content.strip().startswith("```"), \
+        f"json_object must not return a markdown code fence; got: {content!r}"
+    json.loads(content)
 
 
 def test_max_tokens_respected_with_mcp():

@@ -40,11 +40,13 @@ class Apfel < Formula
   sha256 "${sha256}"
   license "MIT"
 
+  depends_on arch: :arm64
   depends_on :macos
   depends_on macos: :tahoe
 
   def install
     bin.install "apfel"
+    man1.install "apfel.1"
   end
 
   service do
@@ -80,7 +82,8 @@ class Apfel < Formula
   end
 
   test do
-    assert_match "apfel v${version}", shell_output("#{bin}/apfel --version")
+    assert_match "apfel v#{version}", shell_output("#{bin}/apfel --version")
+    assert_predicate man1/"apfel.1", :exist?
   end
 end
 EOF
