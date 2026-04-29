@@ -14,17 +14,24 @@ public struct ToolDef: Sendable {
 }
 
 /// Result of executing a prompt through the unified processPrompt() pipeline.
-public struct ProcessPromptResult: Sendable {
+package struct ProcessPromptResult: Sendable {
     public let content: String
     public let toolLog: [ToolLogEntry]
+    public let finishReason: FinishReason
 
+    public init(content: String, toolLog: [ToolLogEntry], finishReason: FinishReason) {
+        self.content = content; self.toolLog = toolLog; self.finishReason = finishReason
+    }
+
+    /// Pre-1.3.3 initialiser preserved for source compatibility. Delegates to
+    /// the three-argument init with `finishReason: .stop`.
     public init(content: String, toolLog: [ToolLogEntry]) {
-        self.content = content; self.toolLog = toolLog
+        self.init(content: content, toolLog: toolLog, finishReason: .stop)
     }
 }
 
 /// A log entry from executing a tool call.
-public struct ToolLogEntry: Sendable, Equatable {
+package struct ToolLogEntry: Sendable, Equatable {
     public let name: String
     public let args: String
     public let result: String

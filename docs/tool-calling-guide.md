@@ -7,6 +7,8 @@ and apfel's OpenAI-compatible tool calling implementation.
 
 > **Looking for ready-made MCPs?** [apfel-mcp.franzai.com](https://apfel-mcp.franzai.com/) ships three token-budget-optimized MCP servers designed for apfel's 4096-token context window: `url-fetch`, `ddg-search`, and the flagship compound `search-and-fetch` tool. `brew install Arthur-Ficial/tap/apfel-mcp`. The repo is open for contributions of new apfel-optimized MCPs - see [apfel-mcp.franzai.com/#contribute](https://apfel-mcp.franzai.com/#contribute).
 
+> **Managing many MCPs?** [Arthur-Ficial/apfel-run](https://github.com/Arthur-Ficial/apfel-run) is an MIT wrapper that keeps an enabled/disabled list in `~/.config/apfel/mcps.conf` (comment out with `-` to disable), builds `APFEL_MCP`, and `execve`s apfel. Stop typing `--mcp` on every call; edit the file instead.
+
 ---
 
 ## How It Works

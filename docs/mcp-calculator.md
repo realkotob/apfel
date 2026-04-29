@@ -39,6 +39,22 @@ apfel --mcp-timeout 30 --mcp ./remote-server.py "hello"
 apfel "Hello"
 ```
 
+### Persistent MCP registry (apfel-run)
+
+If you find yourself typing the same `--mcp` list every day, [Arthur-Ficial/apfel-run](https://github.com/Arthur-Ficial/apfel-run) (MIT, ~200 LOC) reads a plain text config at `~/.config/apfel/mcps.conf`, builds `APFEL_MCP` from the enabled lines, and `execve`s apfel. Comment out a line with `-` to disable, uncomment to re-enable.
+
+```bash
+# ~/.config/apfel/mcps.conf
+/Users/me/mcp/calc.py
+/Users/me/mcp/web.py
+-/Users/me/mcp/filesystem.py   # disabled
+
+apfel-run "What is 15 times 27?"    # same as apfel + all enabled MCPs
+apfel-run --list                    # see what's on / off
+```
+
+This keeps apfel itself flag-only - the registry layer lives in its own 200-LOC wrapper.
+
 ## Remote MCP servers
 
 Remote MCP uses Streamable HTTP transport (MCP spec `2025-03-26`):

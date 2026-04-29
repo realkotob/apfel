@@ -1,0 +1,416 @@
+.TH APFEL 1 "2026-04-17" "apfel @VERSION@" "User Commands"
+.SH NAME
+apfel \- Apple Intelligence from the command line
+.SH SYNOPSIS
+.B apfel
+.RI [ options ]
+.RI [ prompt ]
+.br
+.B apfel
+.B \-f
+.I file
+.RI [ options ]
+.I prompt
+.br
+.B apfel
+.B \-\-chat
+.RI [ options ]
+.br
+.B apfel
+.B \-\-stream
+.RI [ options ]
+.I prompt
+.br
+.B apfel
+.B \-\-serve
+.RI [ server-options ]
+.br
+.B apfel
+.B \-\-benchmark
+.br
+.B apfel
+.B \-\-model-info
+.br
+.B apfel
+.B \-\-update
+.SH DESCRIPTION
+.B apfel
+is a command-line interface and OpenAI-compatible HTTP server for
+Apple's on-device FoundationModels large language model. Inference
+runs entirely on-device on Apple Silicon Macs that have Apple
+Intelligence enabled. No data leaves the machine for inference.
+.PP
+.B apfel
+has three modes:
+.TP
+.B unix tool
+Send a single prompt from arguments or standard input and receive
+the response on standard output. Pipe-friendly. Respects
+.BR NO_COLOR (7),
+isatty detection, and returns structured exit codes for scripting.
+.TP
+.B interactive chat
+Run an interactive multi-turn conversation with readline editing,
+history, and automatic context trimming.
+.TP
+.B HTTP server
+Expose an OpenAI-compatible HTTP API on a loopback or public port,
+suitable as a drop-in replacement for code written against
+.I openai.OpenAI(base_url=...) .
+.PP
+The model's context window is approximately 4096 tokens. Requests
+that exceed it are trimmed according to the active context strategy
+or rejected with exit code 4 if the
+.B strict
+strategy is selected.
+.SH OPTIONS
+.TP
+.BR \-f ", " \-\-file " " \fIpath\fR
+Attach file content to the prompt. Repeatable; accepts multiple
+files.
+.TP
+.BR \-s ", " \-\-system " " \fItext\fR
+Set a system prompt. Applied once per session.
+.TP
+.BI \-\-system-file " path"
+Read the system prompt from a file.
+.TP
+.BR \-o ", " \-\-output " " \fIformat\fR
+Output format.
+.I format
+is
+.B plain
+(default) or
+.BR json .
+In
+.B json
+mode, a single JSON object with
+.BR content ,
+.BR usage ,
+and
+.B finish_reason
+keys is written to stdout.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress non-essential output such as banners and chat headers.
+.TP
+.B \-\-no-color
+Disable ANSI color output. Equivalent to setting
+.BR NO_COLOR .
+.TP
+.BI \-\-temperature " n"
+Sampling temperature. Non-negative float, e.g.
+.BR 0.7 .
+.TP
+.BI \-\-seed " n"
+Random seed for reproducible output. Positive integer.
+.TP
+.BI \-\-max-tokens " n"
+Maximum number of tokens to generate in the response.
+.TP
+.BI \-\-mcp " path|url"
+Attach a local or remote Model Context Protocol tool server.
+Repeatable; attach multiple servers by repeating the flag. Local
+servers are stdio subprocesses; remote servers are HTTP endpoints.
+.TP
+.BI \-\-mcp-token " token"
+Bearer token for authenticating to a remote MCP server. Prefer the
+.B APFEL_MCP_TOKEN
+environment variable so the token does not appear in process lists.
+.TP
+.BI \-\-mcp-timeout " n"
+MCP server timeout in seconds. Default
+.BR 5 .
+.TP
+.B \-\-permissive
+Use permissive content guardrails for the session. The default
+guardrail profile enforces Apple's standard safety policies.
+.TP
+.BR \-\-retry " [" \fIn\fR ]
+Enable retry with exponential backoff on transient errors. Defaults
+to
+.B 3
+retries when the flag is given without a value.
+.TP
+.B \-\-model-info
+Print the active model's capabilities and exit.
+.TP
+.B \-\-benchmark
+Run the internal performance benchmark suite.
+.TP
+.B \-\-update
+Check for updates and, if available, upgrade via Homebrew.
+.TP
+.B \-\-debug
+Enable verbose debug logging to standard error in every mode.
+.TP
+.BR \-h ", " \-\-help
+Print usage information and exit.
+.TP
+.BR \-v ", " \-\-version
+Print the version string and exit.
+.TP
+.B \-\-release
+Print detailed release and build information and exit.
+.SH "CONTEXT OPTIONS"
+.TP
+.BI \-\-context-strategy " strategy"
+Context-management strategy applied when the conversation approaches
+the model's context window. One of
+.BR newest-first " (default), "
+.BR oldest-first ", "
+.BR sliding-window ", "
+.BR summarize ", or "
+.BR strict
+(error on overflow with exit code 4).
+.TP
+.BI \-\-context-max-turns " n"
+Maximum number of history turns to retain. Only meaningful with
+.BR sliding-window .
+.TP
+.BI \-\-context-output-reserve " n"
+Tokens reserved for the model's output. Default
+.BR 512 .
+.SH "SERVER OPTIONS"
+.TP
+.B \-\-serve
+Start the OpenAI-compatible HTTP server.
+.TP
+.BI \-\-port " number"
+Port to bind. Default
+.BR 11434 .
+.TP
+.BI \-\-host " address"
+Bind address. Default
+.BR 127.0.0.1 .
+Use
+.B 0.0.0.0
+to accept connections on all interfaces.
+.TP
+.B \-\-cors
+Emit permissive CORS headers for browser clients.
+.TP
+.BI \-\-allowed-origins " origins"
+Comma-separated list of additional origins to permit alongside the
+localhost defaults.
+.TP
+.B \-\-no-origin-check
+Disable the origin check entirely. Allows any origin. Dangerous on
+non-loopback binds.
+.TP
+.BI \-\-token " secret"
+Require a
+.B Bearer
+token on all requests except
+.B /health
+(see
+.BR \-\-public-health ).
+.TP
+.B \-\-token-auto
+Generate a random Bearer token, require it, and print it to stderr
+once at startup.
+.TP
+.B \-\-public-health
+Keep
+.B /health
+unauthenticated when a token is required. Useful for load balancers
+and uptime checks on non-loopback binds.
+.TP
+.B \-\-footgun
+Disable all protections. Equivalent to
+.B \-\-no-origin-check
+and
+.BR \-\-cors .
+Intended for local development only.
+.TP
+.BI \-\-max-concurrent " n"
+Maximum number of concurrent model requests. Default
+.BR 5 .
+Additional requests are queued.
+.SH ENVIRONMENT
+.TP
+.B APFEL_SYSTEM_PROMPT
+Default system prompt for every invocation.
+.TP
+.B APFEL_MCP
+Colon-separated list of MCP server paths or URLs to attach.
+Equivalent to repeating
+.BR \-\-mcp .
+.TP
+.B APFEL_MCP_TIMEOUT
+MCP server timeout in seconds. Default
+.BR 5 .
+.TP
+.B APFEL_MCP_TOKEN
+Bearer token for authenticating to remote MCP servers. Preferred
+over
+.B \-\-mcp-token
+so the token does not appear in process lists.
+.TP
+.B APFEL_HOST
+Server bind address. Default
+.BR 127.0.0.1 .
+.TP
+.B APFEL_PORT
+Server port. Default
+.BR 11434 .
+.TP
+.B APFEL_TOKEN
+Bearer token for server authentication. Equivalent to
+.BR \-\-token .
+.TP
+.B APFEL_TEMPERATURE
+Default sampling temperature.
+.TP
+.B APFEL_MAX_TOKENS
+Default maximum number of tokens to generate.
+.TP
+.B APFEL_CONTEXT_STRATEGY
+Default context-management strategy.
+.TP
+.B APFEL_CONTEXT_MAX_TURNS
+Maximum history turns for the
+.B sliding-window
+strategy.
+.TP
+.B APFEL_CONTEXT_OUTPUT_RESERVE
+Tokens reserved for the model's output. Default
+.BR 512 .
+.TP
+.B NO_COLOR
+When set to any non-empty value, disables ANSI color output. See
+.UR https://no-color.org
+https://no-color.org
+.UE .
+.SH "EXIT STATUS"
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Runtime error, including tool execution errors and unexpected
+failures.
+.TP
+.B 2
+Usage error. Invalid flags, conflicting modes, or malformed values.
+.TP
+.B 3
+Guardrail blocked. The input or output violated the active content
+policy.
+.TP
+.B 4
+Context overflow. The input exceeds the model's context window and
+the active strategy was
+.BR strict .
+.TP
+.B 5
+Model unavailable. Apple Intelligence is not enabled or the on-device
+model is not downloaded.
+.TP
+.B 6
+Rate limited or busy. Exceeded
+.BR \-\-max-concurrent ,
+or a concurrent session lock is held.
+.SH FILES
+.TP
+.I /usr/local/bin/apfel
+Binary installed by
+.BR "make install" .
+.TP
+.I /usr/local/share/man/man1/apfel.1
+This manual page.
+.TP
+.I $(brew --prefix)/bin/apfel
+Binary installed by
+.BR "brew install apfel" .
+.TP
+.I $(brew --prefix)/Cellar/apfel/<version>/homebrew.mxcl.apfel.plist
+launchd plist used by the Homebrew service integration
+.RB ( "brew services start apfel" ).
+.SH EXAMPLES
+Send a single prompt:
+.PP
+.RS 4
+.nf
+apfel "What is the capital of Austria?"
+.fi
+.RE
+.PP
+Stream a haiku:
+.PP
+.RS 4
+.nf
+apfel --stream "Write a haiku about code"
+.fi
+.RE
+.PP
+Run an interactive session with a custom personality:
+.PP
+.RS 4
+.nf
+apfel -s "You are a pirate" --chat
+.fi
+.RE
+.PP
+Pipe input from standard input:
+.PP
+.RS 4
+.nf
+cat README.md | apfel "Summarize this"
+.fi
+.RE
+.PP
+Extract the response in JSON mode with
+.BR jq (1):
+.PP
+.RS 4
+.nf
+apfel -o json "Translate to German: hello" | jq -r .content
+.fi
+.RE
+.PP
+Start the OpenAI-compatible server on port 3000 with CORS:
+.PP
+.RS 4
+.nf
+apfel --serve --port 3000 --host 0.0.0.0 --cors
+.fi
+.RE
+.PP
+Attach an MCP calculator server and ask a math question:
+.PP
+.RS 4
+.nf
+apfel --mcp mcp/calculator/server.py "What is 127 * 31?"
+.fi
+.RE
+.SH BUGS
+Report bugs at
+.UR https://github.com/Arthur-Ficial/apfel/issues
+https://github.com/Arthur-Ficial/apfel/issues
+.UE .
+.PP
+Known limitations:
+.IP \[bu] 2
+Context window is approximately 4096 tokens. Longer histories are
+trimmed or rejected per the active context strategy.
+.IP \[bu]
+Embeddings, image generation, and image input are not supported;
+the OpenAI-compatible server returns
+.B 501 Not Implemented
+for those endpoints.
+.IP \[bu]
+Requires Apple Silicon, macOS 26 (Tahoe) or newer, and Apple
+Intelligence enabled in System Settings.
+.SH "SEE ALSO"
+.BR jq (1),
+.BR curl (1),
+.BR brew (1),
+.BR man (1).
+.PP
+Project homepage and full documentation:
+.UR https://github.com/Arthur-Ficial/apfel
+https://github.com/Arthur-Ficial/apfel
+.UE .
+.SH AUTHORS
+Franz Enzenhofer and contributors.

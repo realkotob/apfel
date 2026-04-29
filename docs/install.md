@@ -1,4 +1,4 @@
-# Install — Detailed Guide
+# Install - Detailed Guide
 
 ## Requirements
 
@@ -11,13 +11,26 @@
 ## Option 1: Homebrew (recommended)
 
 ```bash
-brew tap Arthur-Ficial/tap
 brew install apfel
+```
+
+Same-day releases (homebrew-core autobump can lag up to ~24h):
+
+```bash
+brew install Arthur-Ficial/tap/apfel
 ```
 
 No build tools needed. See [brew-install.md](brew-install.md) for troubleshooting.
 
-## Option 2: Build from source
+## Option 2: Nix (nixpkgs)
+
+```bash
+nix profile install nixpkgs#apfel-llm
+```
+
+Attribute name is `apfel-llm` because nixpkgs already has an unrelated `apfel` package (a particle-physics PDF library); the binary on `$PATH` is still `apfel`. The package landed via [NixOS/nixpkgs#508084](https://github.com/NixOS/nixpkgs/pull/508084). See [docs/nixpkgs.md](nixpkgs.md) for automation details.
+
+## Option 3: Build from source
 
 Requires Swift 6.3+ with developer tools that include the **macOS 26.4 SDK**. Xcode is **not** required - Command Line Tools are enough.
 
@@ -27,7 +40,7 @@ cd apfel
 make install
 ```
 
-`make install` auto-bumps the version, builds a release binary, and installs to `/usr/local/bin/apfel`.
+`make install` builds a release binary and installs to `/usr/local/bin/apfel`.
 
 ### Verify your toolchain
 
@@ -106,7 +119,7 @@ If `apfel --model-info` shows `available: no`, the specific reason is printed al
 | **Device not eligible** | Intel Mac, or Mac older than M1 | Apple Silicon (M1 or later) is required. This is a hard Apple requirement - there is no workaround. |
 | **Model not ready** | On-device model is still downloading (~3-4 GB on first enable) | Keep your Mac on **Wi-Fi and power**. Check download progress in System Settings > Apple Intelligence & Siri. Try again in a few minutes. |
 
-apfel is a thin wrapper around Apple's on-device model — it cannot turn on Apple Intelligence for you. Once the underlying Apple toggle is on and models are downloaded, apfel just works.
+apfel is a thin wrapper around Apple's on-device model - it cannot turn on Apple Intelligence for you. Once the underlying Apple toggle is on and models are downloaded, apfel just works.
 
 Apple's full Apple Intelligence setup guide: [support.apple.com/en-us/121115](https://support.apple.com/en-us/121115)
 

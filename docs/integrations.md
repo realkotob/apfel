@@ -2,6 +2,8 @@
 
 Community-contributed configurations for using apfel with other tools.
 
+For **scripting language guides** (how to call apfel from Python, Node.js, Ruby, PHP, Bash, Zsh, AppleScript, Swift, Perl, AWK) see [docs/guides/index.md](guides/index.md). Every snippet there was run against a live apfel server; lab repo: [apfel-guides-lab](https://github.com/Arthur-Ficial/apfel-guides-lab).
+
 ---
 
 ## opencode
@@ -69,6 +71,55 @@ apfel --serve
 ---
 
 Huge thanks to [**@tvi** (Tomas Virgl)](https://github.com/tvi) for contributing this integration and for taking the time to provide a working config and a real screenshot. This is exactly the kind of community contribution that makes apfel more useful.
+
+---
+
+## Zed
+
+[Zed](https://zed.dev)'s agent panel works with apfel via the chat-completions provider. On-device, no key.
+
+**Heads-up:** use `language_models.openai_compatible` (chat). Do **not** use `edit_predictions.open_ai_compatible_api` - that's a legacy text-completions endpoint apfel deliberately doesn't support.
+
+**Config:** `~/.config/zed/settings.json`
+
+```json
+{
+  "language_models": {
+    "openai_compatible": {
+      "Apfel": {
+        "api_url": "http://127.0.0.1:11434/v1",
+        "available_models": [
+          {
+            "name": "apple-foundationmodel",
+            "display_name": "Apfel (apple on-device)",
+            "max_tokens": 4096,
+            "max_output_tokens": 1024,
+            "capabilities": { "tools": true, "images": false, "parallel_tool_calls": false, "prompt_cache_key": false }
+          }
+        ]
+      }
+    }
+  }
+}
+```
+
+Start apfel:
+
+```bash
+apfel --serve
+```
+
+Launch Zed (Zed insists on a key for the provider; apfel ignores it):
+
+```bash
+APFEL_API_KEY=dummy zed
+```
+
+Open the agent panel (`Cmd+?`), pick `Apfel (apple on-device)`, send a prompt. Zed POSTs to `/v1/chat/completions` on apfel.
+
+![Zed agent panel powered by apfel](../screenshots/zed-integration.png)
+
+*Zed 0.233.x. Left: agent thread answering through apfel. Right: open Python file. Bottom: `Apfel (apple on-device)` selected. Stream traces from `apfel --serve` confirm `POST /v1/chat/completions/stream 200` per turn.*
 
 ---
 

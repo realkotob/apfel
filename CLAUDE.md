@@ -4,12 +4,9 @@
 
 ## The Golden Goal
 
-apfel has ONE purpose with THREE delivery modes:
+apfel exposes Apple's on-device FoundationModels LLM. **Two things are the product. Two things are byproducts.**
 
-> **Expose Apple's on-device FoundationModels LLM as a usable, powerful UNIX tool
-> and an OpenAI API-compatible server, with a working command-line chat.**
-
-### The three modes, in priority order:
+### Core product (this is what apfel IS)
 
 1. **UNIX tool** (`apfel "prompt"`, `echo "text" | apfel`, `apfel --stream`)
    - Pipe-friendly, composable, correct exit codes
@@ -17,19 +14,43 @@ apfel has ONE purpose with THREE delivery modes:
    - `--json` output for machine consumption
    - Respects `NO_COLOR`, `--quiet`, stdin detection
 
-2. **OpenAI-compatible HTTP server** (`apfel --serve`)
+2. **OpenAI API-compatible HTTP server** (`apfel --serve`)
    - Drop-in replacement for `openai.OpenAI(base_url="http://localhost:11434/v1")`
    - `/v1/chat/completions` (streaming + non-streaming)
    - `/v1/models`, `/health`, tool calling, `response_format`
    - Honest 501s for unsupported features (embeddings, legacy completions)
    - CORS for browser clients
 
-3. **Command-line chat** (`apfel --chat`)
-   - Interactive multi-turn with context window protection
-   - Typed error display, context rotation when approaching limit
-   - System prompt support
+These two modes are what the README.md leads with. Every design decision, test, and release gate is scored against them first.
+
+### Byproducts (useful, but not the pitch)
+
+3. **Interactive mini TUI chat** (`apfel --chat`) - **a byproduct for quick testing, not a main product.**
+   - Ships because the pieces are already there (Session, ContextManager, tool calling)
+   - Handy for quick testing a prompt or a local MCP server without writing a client
+   - Should not dominate README real-estate; a short Quick Start entry is enough
+   - For a GUI chat app, point users to `apfel-chat` (separate repo)
+
+4. **Swift library** (`import ApfelCore`, first shipped in `1.1.0`) - **a goal, but a secondary surface.**
+   - Pure, FoundationModels-free Swift Package library product
+   - OpenAI-compatible request/response types, validation, tool-call handling, schema parsing, MCP protocol, error classification, retry logic, context-trimming strategies
+   - Downstream apps call FoundationModels themselves - apfel just supplies the types and policies
+   - DocC catalog at `Sources/Core/ApfelCore.docc/`, runnable examples at `Examples/`, stability contract in [STABILITY.md](STABILITY.md)
+   - API-breakage guarded in CI via `swift package diagnose-api-breaking-changes`
+   - **Must NOT be front-and-center in README.md.** One single link to [docs/swift-library.md](docs/swift-library.md) further down the page - no install snippet, no `import ApfelCore` sample, no types list. All Swift-library README content lives on dedicated docs pages.
 
 The Debug GUI has been extracted to its own repo: [apfel-gui](https://github.com/Arthur-Ficial/apfel-gui)
+
+### README.md structure rule
+
+The README.md mirrors this priority - **violating this structure is a bug.**
+
+- Hero + tagline: UNIX tool and OpenAI-compatible server only
+- "What it is" table: **two rows** (UNIX tool, OpenAI server). Nothing else.
+- Right after the table: a one-command "Try it right away: `apfel --chat`" pointer. Rationale: chat is not the main product, but it is the lowest-friction way for a new user to verify install and see apfel responding - so the try-it pointer belongs up top, next to the install block.
+- Quick Start: UNIX tool first, server second, chat gets a short subsection covering flags and variants (MCP, system prompt, debug)
+- Swift library: **one link, one line**, in a later section (e.g. "Reference Docs" or near the `apfel tree`), pointing to [docs/swift-library.md](docs/swift-library.md). No code samples, no `Package.swift` snippets, no type catalogue in the README.
+- All Swift-library detail (install snippet, import example, API surface summary, stability contract pointers, example catalogue) lives on `docs/swift-library.md` and the DocC catalog. Not in README.md.
 
 ### Non-negotiable principles:
 
@@ -38,10 +59,12 @@ The Debug GUI has been extracted to its own repo: [apfel-gui](https://github.com
 - **Clean code, clean logic.** No hacks. Proper error types. Real token counts.
 - **Swift 6 strict concurrency.** No data races.
 - **Usable security.** Secure defaults that don't get in the way.
+- **TDD always, red-to-green, 100%.** No production code without a failing test first. Write the test, watch it fail for the right reason, write the minimal code to pass, watch it go green. No exceptions, no "I'll add tests after", no "this is too simple to test". Behavior-preserving refactors are covered by existing tests; new behavior gets a new failing test first.
 
 ### Documentation style:
 
 - **Links in docs and README:** Always use the URL/path as the anchor text, not generic phrases like "full guide" or "click here". Example: `[docs/background-service.md](docs/background-service.md)` not `[full guide](docs/background-service.md)`.
+- **One code block, one purpose - never mix mutually-exclusive commands.** A fenced code block must be safe to copy-paste verbatim into a terminal: every line either runs in sequence as part of the same workflow, or the block contains only one command. Alternatives (e.g. `brew install apfel` vs `brew install Arthur-Ficial/tap/apfel` vs `git clone … && make install`) get **separate** fenced blocks with a one-line prose lead-in describing when to use that block. Inline `#` comments labelling alternatives inside one block are not a substitute - users hit "copy" and run the lot. This applies to README.md, every file under `docs/`, and any future user-facing surface.
 
 ## Architecture
 
@@ -61,42 +84,29 @@ HTTP Server (/v1/*) ───────┘   ContextManager → Transcript API
 
 ## Current Status
 
-- Version source of truth: `.version` (currently `0.9.0`)
-- Tests: `203` unit + `174` integration (full suite ~90 seconds)
-- Issues `#33` through `#45` addressed
-- v0.9.0: The Unification Refactor
-  - Shared `processPrompt()` eliminates 5 duplicated code blocks between `singlePrompt()` and `chat()`
-  - Chat+MCP crash fixed (#43): session created without requiring user message at init
-  - `--debug` flag works in all modes (CLI, chat, server) - debug output to stderr (#44)
-  - Ctrl-C exits chat cleanly (SIGINT handled via C shim around libedit)
-  - Missing `ApfelError` cases: `unsupportedGuide`, `decodingFailure` (#41)
-  - Context rotation bug fixed: MCP tools re-injected after rotation
-  - Summarizer uses `makeModel(permissive:)` instead of `SystemLanguageModel.default`
-  - Dead code removed: `sseStopChunk()`, `buildSystemPrompt()`, `formatToolResult()`
-  - Homebrew formula: ARM check moved from hard error to caveats warning (#45)
-  - 35 new chat integration tests (startup, exit, MCP, debug, JSON, Ctrl-C, multi-turn)
-  - Integration test conftest auto-starts servers
+- Version: `1.0.0` (source of truth: `.version`)
+- Tests: 597 unit + 246 integration
+- Distribution: homebrew-core (`brew install apfel`), nixpkgs (`nix profile install nixpkgs#apfel-llm`), and the Arthur-Ficial/homebrew-tap
+- Stability policy: [STABILITY.md](STABILITY.md)
+- Security policy: [SECURITY.md](SECURITY.md)
 
 ## Build & Test
 
 ```bash
-make install                   # bump patch + build release + install to /usr/local/bin
-make build                     # bump patch + build release
-make release-minor             # bump minor (0.6.x -> 0.7.0) + build
-make release-major             # bump major (0.x.y -> 1.0.0) + build
+make test                      # BUILD + ALL TESTS (unit + integration) - the one command you need
+make install                   # build release + install to /usr/local/bin (NO version bump)
+make build                     # build release only (NO version bump)
 make version                   # print current version
-swift build                    # debug build (uses "dev" version stub)
-swift run apfel-tests          # run pure Swift unit tests
+swift build                    # debug build
+swift run apfel-tests          # unit tests only (597 tests)
+make preflight                 # full release qualification (unit + integration + policy checks)
 ```
 
-**Version is in `.version` file** (single source of truth). Every `make build`/`make install` auto-bumps the patch number, updates README badge, and generates `Sources/BuildInfo.swift`. **Never manually edit `.version`, `BuildInfo.swift`, or the README badge** - always use `make build` which updates all three atomically.
+`make test` builds the release binary, runs all 597 unit tests, starts test servers, runs all 246 integration tests, and cleans up. This is the single command for development.
 
-**Always use `make install` for testing changes** - `swift run` uses a debug build, and the installed binary at `/usr/local/bin/apfel` won't reflect your changes until you run `make install`.
+`make install` auto-unlinks Homebrew apfel so the dev binary takes PATH priority. `make uninstall` restores the Homebrew link.
 
-Integration tests (requires server running):
-```bash
-python3 -m pytest Tests/integration/ -v    # release-binary integration tests
-```
+**Version is in `.version` file** (single source of truth). Local builds (`make build`, `make install`) do NOT change the version. Only the release workflow (`make release`) bumps versions. This ensures patch versions mean "published compatible fix", not "someone ran a build". **Never manually edit `.version`, `BuildInfo.swift`, or the README badge** - these are updated atomically by the release workflow.
 
 Regenerate `docs/EXAMPLES.md` (runs 53 prompts against the installed binary, captures real unedited output):
 ```bash
@@ -121,10 +131,10 @@ bash scripts/generate-examples.sh          # ~2 minutes, overwrites docs/EXAMPLE
 | Security | `Sources/Core/OriginValidator.swift`, `Sources/SecurityMiddleware.swift` |
 | MCP client | `Sources/Core/MCPProtocol.swift`, `Sources/MCPClient.swift` |
 | MCP calculator | `mcp/calculator/server.py` |
-| Tests | `Tests/apfelTests/` (188 unit), `Tests/integration/` (139 integration) |
-| Tickets | `open-tickets/` |
+| Tests | `Tests/apfelTests/` (597 unit), `Tests/integration/` (246 integration) |
+
 | Docs | `docs/` (brew-install, EXAMPLES, release, tool-calling-guide) |
-| Scripts | `scripts/generate-examples.sh` (regenerates docs/EXAMPLES.md), `scripts/write-homebrew-formula.sh` |
+| Scripts | `scripts/generate-examples.sh`, `scripts/write-homebrew-formula.sh`, `scripts/release-preflight.sh`, `scripts/post-release-verify.sh` |
 
 ## Handling GitHub Issues
 
@@ -150,6 +160,8 @@ When a new issue comes in, follow this process:
 ## Handling Pull Requests
 
 When a PR is opened, follow this process. Scale the rigor to the PR type - docs-only PRs skip the security audit and test coverage steps, code PRs get the full treatment.
+
+**Automated first-responder:** `Arthur-Ficial/apfel` has a Claude Code routine (`.claude/routines/02-pr-auto-review.md`) that runs this entire process on `pull_request.opened` / `pull_request.synchronize` and posts a `COMMENTED` review. The routine cannot `--approve`, cannot merge, cannot run `make test` (no Apple Intelligence on cloud runners), and cannot cut releases. It is a first-pass safety net, not a replacement for human judgement. Franz still merges, Franz still releases - always. See [docs/routines.md](docs/routines.md) and [.claude/routines/README.md](.claude/routines/README.md).
 
 ### 1. Fetch everything
 
@@ -266,61 +278,104 @@ Do not approve code PRs with P0 findings. For docs-only PRs, a request-changes o
 - `URLSession.shared` for new network code (shared cookie jar, shared cache)
 - Bearer tokens sent over `http://`
 - New `exit()` calls in pure parsing functions
-- Manual edits to `.version`, `README.md` version badge, or `Sources/BuildInfo.swift` (these are `make build` outputs)
+- Manual edits to `.version`, `README.md` version badge, or `Sources/BuildInfo.swift` (these are release workflow outputs)
 - Merge commits in the PR branch history (prefer rebase and squash)
 - Contributor working from their fork's `main` branch instead of a feature branch (cosmetic, but harder to land cleanly)
 
 ## Publishing a Release
 
-**MANDATORY: always use the automated workflow.** No manual releases. No exceptions. One command does everything.
+**MANDATORY: always use the automated workflow.** No manual releases. No exceptions.
+
+### Before releasing
 
 ```bash
-make release                    # patch bump (0.9.17 -> 0.9.18)
-make release TYPE=minor         # minor bump (0.9.x -> 0.10.0)
-make release TYPE=major         # major bump (0.x.y -> 1.0.0)
+make preflight
 ```
 
-This triggers the **Publish Release** GitHub Actions workflow which runs on `macos-26` and does ALL of the following in order, with zero human intervention:
+This runs the full qualification locally: clean git state, on main, unit tests, integration tests (7 suites), policy file checks, version sanity. **Do not release if preflight fails.**
 
-1. Bumps `.version` via `make build` / `make release-minor` / `make release-major`
-2. Builds the release binary
-3. Runs unit tests (`swift run apfel-tests`)
-4. Commits `.version`, `README.md`, `Sources/BuildInfo.swift` and pushes to `main`
-5. Creates a git tag (`v<version>`) and pushes it
-6. Packages `apfel-<version>-arm64-macos.tar.gz` and publishes a GitHub Release
-7. Clones `Arthur-Ficial/homebrew-tap`, regenerates `Formula/apfel.rb` with new URL + SHA256, commits and pushes
-
-After the workflow completes (~3 min), verify locally:
+### Release
 
 ```bash
-brew update && brew upgrade apfel && brew test apfel && apfel --version
+make release                    # patch (1.0.0 -> 1.0.1)
+make release TYPE=minor         # minor (1.0.x -> 1.1.0)
+make release TYPE=major         # major (1.x.y -> 2.0.0)
 ```
 
-**Do NOT manually run `make install`, `make package-release-asset`, `git tag`, `gh release create`, or push to the Homebrew tap.** The workflow does all of it. Manual steps create version drift, duplicate tags, and half-updated taps. If the workflow fails, fix the workflow - don't work around it.
+This runs locally (not on GitHub Actions - GitHub runners lack Apple Intelligence). The script (`scripts/publish-release.sh`) does everything:
 
-The workflow source is `.github/workflows/publish-release.yml`. The `HOMEBREW_TAP_PUSH_TOKEN` secret must exist on `Arthur-Ficial/apfel` (fine-grained token with Contents R/W on `Arthur-Ficial/homebrew-tap`).
+1. Preflight checks (clean tree, on main, up to date with origin)
+2. Bumps `.version` (patch/minor/major)
+3. Builds the release binary
+4. Runs ALL unit tests (~600)
+5. Runs ALL integration test suites under `Tests/integration/` with real Apple Intelligence (cli_e2e, performance, openai_client, openapi_spec, openapi_conformance, security, mcp_server, mcp_remote, plus model-free helpers like test_chat, test_brew_service, test_man_page, test_build_info, test_apfelcore_*)
+6. Commits `.version`, `README.md`, `Sources/BuildInfo.swift` and pushes to `main`
+7. Creates git tag (`v<version>`) and pushes it
+8. Packages tarball and publishes GitHub Release with changelog
+9. Updates the Homebrew tap formula
+
+### After releasing
+
+```bash
+./scripts/post-release-verify.sh
+```
+
+Verifies: GitHub Release exists with tarball, git tag exists, `.version` matches, installed binary matches.
+
+### Distribution channels
+
+apfel ships through three channels. All pull the same signed tarball from each GitHub Release.
+
+- **homebrew-core** - `brew install apfel`. Autobump detects new releases; latency ~24h. We do not maintain the formula.
+- **Arthur-Ficial/homebrew-tap** - `brew install Arthur-Ficial/tap/apfel`. Synchronous, pushed as part of `make release`. Secondary channel; also houses apfel-family tools (apfel-chat, apfel-clip, apfel-mcp, etc.).
+- **nixpkgs** - `nix profile install nixpkgs#apfel-llm`. Name is `apfel-llm` because nixpkgs already has an unrelated physics `apfel` package and the disambiguator landed upstream as `apfel-llm` (PR NixOS/nixpkgs#508084). Bumps come from the community `r-ryantm` bot (~weekly) and contributors with a nixpkgs checkout. We do not run our own auto-bump workflow - the package's `passthru.updateScript` is enough. See [docs/nixpkgs.md](docs/nixpkgs.md).
+- Emergency Homebrew bump: `brew bump-formula-pr apfel --url=<tarball-url> --sha256=<hash>`
+- Emergency nixpkgs bump: see [docs/nixpkgs.md](docs/nixpkgs.md) "Manual self-bump" - clone nixpkgs, edit `pkgs/by-name/ap/apfel-llm/package.nix`, open a PR. Normally not needed; r-ryantm handles it weekly.
+
+### Do NOT manually
+
+- Run `bump-patch`, `bump-minor`, `bump-major` directly
+- Edit `.version`, `BuildInfo.swift`, or README badge
+- Create git tags or run `gh release create`
+- Push to the Homebrew tap manually (the workflow handles it)
 
 ### Integration test rules
 
 - **Never skip tests.** A skipped test is a critical error.
 - Integration tests require two running servers: port 11434 (plain) and port 11435 (with MCP calculator).
 - If servers aren't running, tests skip silently - this is NOT acceptable. Always start them.
-- After releasing, run the full suite against the brew-installed binary as final verification.
 
 ### Post-release checklist
 
-- [ ] Unit tests pass (188+)
-- [ ] Integration tests pass (139+, 0 skipped)
-- [ ] GitHub Release created with tarball
-- [ ] Homebrew tap updated and `brew test` passes
-- [ ] CLAUDE.md test counts and version updated
-- [ ] File a ticket on `Arthur-Ficial/apfel-web` if the landing page shows test counts
+- [ ] `make preflight` passed before release
+- [ ] Publish Release workflow completed green
+- [ ] `./scripts/post-release-verify.sh` passed
+- [ ] CLAUDE.md version and test counts updated (if changed)
+- [ ] File a ticket on `Arthur-Ficial/apfel-web` if the landing page needs update
 
 ## CI / GitHub Actions
 
-- **`macos-26` runner** has Xcode-bundled SDKs (not standalone CLT). The workflow selects the latest available Xcode via `xcode-select` before building.
-- apfel requires **SDK 26.4+** for FoundationModels token-counting APIs (`tokenCount`, `contextSize`). If the runner's highest Xcode is older, the build will fail.
-- **`HOMEBREW_TAP_PUSH_TOKEN`** secret must exist on `Arthur-Ficial/apfel` - fine-grained token with Contents R/W on `Arthur-Ficial/homebrew-tap`.
-- The **Publish Release** workflow (`.github/workflows/publish-release.yml`) is the single source of truth for the release pipeline. It handles version bump, build, test, tag, GitHub Release, and homebrew tap update in one run.
-- The **CI** workflow (`.github/workflows/ci.yml`) runs on PRs and pushes for build + test validation.
-- Release docs: `docs/release.md`
+**IMPORTANT: GitHub CI runs only a SUBSET of tests.** GitHub-hosted `macos-26` runners are Intel Macs with no Apple Intelligence. Most integration tests need the model and cannot run there.
+
+**What GitHub CI runs (automatic, every push/PR):**
+- Build (release binary)
+- ~600 unit tests (pure Swift, no model needed)
+- 21 model-free integration tests (CLI flags, help, version, file handling)
+- Total: ~387 tests
+
+**What GitHub CI CANNOT run (no Apple Intelligence):**
+- Server response tests (openai_client, openapi_spec, openapi_conformance)
+- MCP tool execution tests (mcp_server, mcp_remote)
+- Security tests that send real requests (security)
+- Benchmark tests (performance)
+- Chat mode tests (test_chat)
+- Brew service tests (test_brew_service)
+- Total: ~199 integration tests
+
+**What runs the full suite (local, before every release):**
+- `make preflight` or `make release` on a Mac with Apple Intelligence
+- 597 unit + 246 integration = 843 tests, 0 skipped
+- Release scripts use directory discovery (`Tests/integration/`), not explicit file lists
+- This is the REAL qualification gate. GitHub CI is a safety net, not the source of truth.
+
+SDK 26.4+ required for FoundationModels token-counting APIs. Release docs: [docs/release.md](docs/release.md)
