@@ -2,7 +2,7 @@
 
 Real-world shell scripts powered by Apple Intelligence via `apfel`.
 
-All demos work within the 4096-token context window - small input, small output, instant results.
+All demos work within the on-device context window (4096 tokens on macOS 26, 8192 on macOS 27 - read at runtime) - small input, small output, instant results.
 
 ## cmd
 
@@ -151,3 +151,24 @@ soldiers on at 3.1%, dutifully rendering pixels that nobody is looking at.
 - `apfel` installed and on PATH (`make install`)
 - Apple Intelligence enabled in System Settings
 - macOS 26+, Apple Silicon
+
+## Install demos globally (optional)
+
+The demos are intentionally **not** installed by `brew install apfel` or `make install`. Names like `cmd`, `port`, `explain`, and `naming` are too generic for global `$PATH` - `port` would shadow MacPorts, `cmd` is a common variable name in many shell scripts.
+
+If you want them available system-wide, symlink each one with an `apfel-` prefix:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+for d in cmd explain gitsum mac-narrator naming oneliner port wtd; do
+  ln -sf "$(pwd)/demo/$d" "$HOME/.local/bin/apfel-$d"
+done
+```
+
+Then invoke them as `apfel-cmd "find large files"`, `apfel-port 3000`, etc.
+
+**Caveats:**
+
+- The symlinks point at your current clone. If you move or delete the `apfel/` directory, the symlinks break - re-run the loop from the new location.
+- Make sure `$HOME/.local/bin` is on your `$PATH` (`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`).
+- To remove later: `for d in cmd explain gitsum mac-narrator naming oneliner port wtd; do rm -f "$HOME/.local/bin/apfel-$d"; done`

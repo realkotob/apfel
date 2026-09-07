@@ -34,11 +34,15 @@ func printHeader() {
 /// Behavior depends on output format:
 /// - **plain**: Print response directly. If streaming, print tokens as they arrive.
 /// - **json**: Buffer the complete response, then emit a single JSON object.
-func singlePrompt(_ prompt: String, systemPrompt: String?, stream: Bool, options: SessionOptions = .defaults, mcpManager: MCPManager? = nil) async throws {
+/// Returns the process exit code: 0, or `ApfelExitCodes.noCode` when
+/// `codeOnly` found no fenced block. Discardable because the `--stream` call
+/// sites cannot set `codeOnly` (rejected at parse time) and always get 0.
+@discardableResult
+func singlePrompt(_ prompt: String, systemPrompt: String?, stream: Bool, options: SessionOptions = .defaults, mcpManager: MCPManager? = nil, codeOnly: Bool = false) async throws -> Int32 {
     let mcpTools = await mcpManager?.allTools() ?? []
     let hasMCPTools = !mcpTools.isEmpty
 
-    debugLog("single", "prompt_length=\(prompt.count) stream=\(stream) mcp=\(hasMCPTools)")
+    debugLog("single", "prompt_length=\(prompt.count) stream=\(stream) mcp=\(hasMCPTools) code=\(codeOnly)")
 
     let session: LanguageModelSession
     let finalPrompt: String
@@ -46,7 +50,7 @@ func singlePrompt(_ prompt: String, systemPrompt: String?, stream: Bool, options
         var msgs: [OpenAIMessage] = []
         if let sys = systemPrompt { msgs.append(OpenAIMessage(role: "system", content: .text(sys))) }
         msgs.append(OpenAIMessage(role: "user", content: .text(prompt)))
-        (session, finalPrompt) = try await ContextManager.makeSession(
+        (session, finalPrompt, _) = try await ContextManager.makeSession(
             messages: msgs, tools: mcpTools, options: options, jsonMode: false, toolChoice: nil)
     } else {
         session = makeSession(systemPrompt: systemPrompt, options: options)
@@ -54,11 +58,19 @@ func singlePrompt(_ prompt: String, systemPrompt: String?, stream: Bool, options
     }
     let genOpts = makeGenerationOptions(options)
 
+    // --code buffers the whole response (the crop needs the closing fence),
+    // so delta printing is off even on the bare-pipe streaming path.
     let result = try await processPrompt(
         prompt: finalPrompt, systemPrompt: systemPrompt, session: session,
         options: options, genOpts: genOpts, stream: stream,
-        printDelta: outputFormat == .plain, mcpManager: mcpManager, hasMCPTools: hasMCPTools)
+        printDelta: outputFormat == .plain && !codeOnly, mcpManager: mcpManager, hasMCPTools: hasMCPTools)
     printToolLog(result.toolLog)
+
+    if codeOnly {
+        let exitCode = printCroppedResponse(result.content)
+        printLengthWarningIfNeeded(result.finishReason)
+        return exitCode
+    }
 
     switch outputFormat {
     case .plain:
@@ -67,18 +79,315 @@ func singlePrompt(_ prompt: String, systemPrompt: String?, stream: Bool, options
         let obj = ApfelResponse(
             model: modelName, content: result.content,
             metadata: .init(onDevice: true, version: version))
-        print(jsonString(obj), terminator: "")
+        print(jsonString(obj))
     }
+
+    printLengthWarningIfNeeded(result.finishReason)
+    return 0
+}
+
+/// Print the `--code` output contract (#373): the first fenced block's
+/// content (or, with no fence anywhere, the bare response — a fully steered
+/// model omits the fence and the response IS the code) to stdout, nothing
+/// else. An empty response exits `noCode` (7) so scripts can branch on
+/// "no code" vs "run failed".
+func printCroppedResponse(_ content: String) -> Int32 {
+    guard let crop = CodeCropper.crop(from: content) else {
+        printStderr("\(styledErr("apfel:", .yellow)) empty model response, no code to print")
+        return ApfelExitCodes.noCode
+    }
+    switch outputFormat {
+    case .plain:
+        // crop.code already ends with exactly one newline (or is empty for a
+        // deliberately empty block) — print verbatim, no extra terminator.
+        print(crop.code, terminator: "")
+    case .json:
+        let obj = ApfelResponse(
+            model: modelName, content: crop.code, language: crop.language,
+            metadata: .init(onDevice: true, version: version))
+        print(jsonString(obj))
+    }
+    return 0
+}
+
+/// Shared stderr warning for responses truncated at the context window.
+func printLengthWarningIfNeeded(_ finishReason: FinishReason?) {
+    if finishReason == .length {
+        printStderr("\(styledErr("apfel:", .yellow)) response truncated at the context window (finish_reason=length). Pass --max-tokens to control the cap explicitly.")
+    }
+}
+
+// MARK: - Structured Single Prompt (#361)
+
+/// Handle a single prompt with schema-guaranteed structured output (`--schema`).
+///
+/// The compiled `GenerationSchema` constrains decoding, so the output is
+/// always a schema-valid JSON object - no fence stripping, no retry-on-invalid
+/// JSON. Plain output prints the raw JSON (newline-terminated, jq-ready);
+/// `-o json` wraps it as a string in the standard ApfelResponse envelope.
+func structuredSinglePrompt(
+    _ prompt: String,
+    systemPrompt: String?,
+    schemaJSON: String,
+    schemaName: String,
+    options: SessionOptions = .defaults
+) async throws {
+    let schema = try SchemaConverter.generationSchema(fromJSON: schemaJSON, name: schemaName)
+    let session = makeSession(systemPrompt: systemPrompt, options: options)
+    let genOpts = makeGenerationOptions(options)
+    debugLog("schema", "prompt_length=\(prompt.count) schema_name=\(schemaName)")
+
+    let retryMax = options.retryEnabled ? options.retryCount : 0
+    let content = try await withRetry(maxRetries: retryMax) {
+        try await session.respond(to: prompt, schema: schema, options: genOpts).content.jsonString
+    }
+
+    switch outputFormat {
+    case .plain:
+        print(content)
+    case .json:
+        let obj = ApfelResponse(
+            model: modelName, content: content,
+            metadata: .init(onDevice: true, version: version))
+        print(jsonString(obj))
+    }
+}
+
+// MARK: - One-Shot Multi-Turn (#363)
+
+/// Handle `--messages`: a whole OpenAI-style conversation in, the next
+/// assistant message out. Reuses the server's transcript building
+/// (`ContextManager.makeSession`) so CLI and server multi-turn semantics
+/// cannot drift. Composes with `--stream` (delta printing) and `--schema`
+/// (schema-guaranteed reply to the conversation).
+/// Returns the process exit code: 0, or `ApfelExitCodes.noCode` when
+/// `codeOnly` found no fenced block (same contract as `singlePrompt`).
+@discardableResult
+func messagesPrompt(
+    messagesJSON: String,
+    systemPrompt: String?,
+    stream: Bool,
+    schemaJSON: String?,
+    schemaName: String?,
+    options: SessionOptions = .defaults,
+    mcpManager: MCPManager? = nil,
+    codeOnly: Bool = false
+) async throws -> Int32 {
+    var messages = try MessagesInput.decode(messagesJSON)
+    if let sys = systemPrompt {
+        messages.insert(OpenAIMessage(role: "system", content: .text(sys)), at: 0)
+    }
+    let mcpTools = await mcpManager?.allTools() ?? []
+    let hasMCPTools = !mcpTools.isEmpty
+    debugLog("messages", "count=\(messages.count) stream=\(stream) mcp=\(hasMCPTools) schema=\(schemaJSON != nil)")
+
+    let (session, finalPrompt, _) = try await ContextManager.makeSession(
+        messages: messages, tools: mcpTools, options: options, jsonMode: false, toolChoice: nil)
+    let genOpts = makeGenerationOptions(options)
+
+    if let schemaJSON {
+        let schema = try SchemaConverter.generationSchema(fromJSON: schemaJSON, name: schemaName ?? "schema")
+        let retryMax = options.retryEnabled ? options.retryCount : 0
+        let content = try await withRetry(maxRetries: retryMax) {
+            try await session.respond(to: finalPrompt, schema: schema, options: genOpts).content.jsonString
+        }
+        switch outputFormat {
+        case .plain:
+            print(content)
+        case .json:
+            let obj = ApfelResponse(
+                model: modelName, content: content,
+                metadata: .init(onDevice: true, version: version))
+            print(jsonString(obj))
+        }
+        return 0
+    }
+
+    let result = try await processPrompt(
+        prompt: finalPrompt, systemPrompt: systemPrompt, session: session,
+        options: options, genOpts: genOpts, stream: stream,
+        printDelta: outputFormat == .plain && !codeOnly, mcpManager: mcpManager, hasMCPTools: hasMCPTools)
+    printToolLog(result.toolLog)
+
+    if codeOnly {
+        let exitCode = printCroppedResponse(result.content)
+        printLengthWarningIfNeeded(result.finishReason)
+        return exitCode
+    }
+
+    switch outputFormat {
+    case .plain:
+        if hasMCPTools || !stream { print(result.content) } else { print() }
+    case .json:
+        let obj = ApfelResponse(
+            model: modelName, content: result.content,
+            metadata: .init(onDevice: true, version: version))
+        print(jsonString(obj))
+    }
+
+    printLengthWarningIfNeeded(result.finishReason)
+    return 0
+}
+
+// MARK: - Token Budget Preflight
+
+/// Count tokens for a prompt without calling the model (`--count-tokens`).
+func countTokens(
+    mergedPrompt: String,
+    positionalPrompt: String,
+    pipedContent: String?,
+    fileAttachments: [FileAttachment],
+    systemPrompt: String?,
+    options: SessionOptions = .defaults,
+    mcpManager: MCPManager? = nil
+) async throws -> TokenBudgetReport {
+    let mcpTools = await mcpManager?.allTools() ?? []
+    let outputReserve = options.contextConfig.outputReserve
+    let contextSize = await TokenCounter.shared.contextSize
+    let tokenCountFallback = await TokenCounter.shared.tokenCountFallback
+    await TokenCounter.shared.resetRuntimeFallbackFlag()
+    let approximate = tokenCountFallback != nil
+    // Session/entry construction is only unsafe when the MODEL is unavailable.
+    // Under .osTooOld generation works fine: entries are built normally and
+    // counted via the chars/4 fallback, which prices tool definitions too -
+    // so MCP tool schemas are not silently counted as 0 and --strict cannot
+    // false-pass on macOS < 26.4 (#326).
+    let modelUnavailable = tokenCountFallback == .modelUnavailable
+
+    let inputEntries: [Transcript.Entry]
+    let noToolEntries: [Transcript.Entry]?
+
+    if modelUnavailable {
+        // Avoid LanguageModelSession construction when the model is unavailable.
+        inputEntries = []
+        noToolEntries = nil
+    } else if !mcpTools.isEmpty {
+        var msgs: [OpenAIMessage] = []
+        if let sys = systemPrompt { msgs.append(OpenAIMessage(role: "system", content: .text(sys))) }
+        msgs.append(OpenAIMessage(role: "user", content: .text(mergedPrompt)))
+        let (_, _, withTools) = try await ContextManager.makeSession(
+            messages: msgs, tools: mcpTools, options: options, jsonMode: false, toolChoice: nil)
+        inputEntries = sessionInputEntries(
+            builtEntries: withTools, finalPrompt: mergedPrompt, options: options)
+        let (_, _, withoutTools) = try await ContextManager.makeSession(
+            messages: msgs, tools: nil, options: options, jsonMode: false, toolChoice: nil)
+        noToolEntries = sessionInputEntries(
+            builtEntries: withoutTools, finalPrompt: mergedPrompt, options: options)
+    } else {
+        var builtEntries: [Transcript.Entry] = []
+        if let sys = systemPrompt, !sys.isEmpty {
+            builtEntries = transcriptEntries(makeSession(systemPrompt: sys, options: options).transcript)
+        }
+        inputEntries = sessionInputEntries(builtEntries: builtEntries, finalPrompt: mergedPrompt, options: options)
+        noToolEntries = nil
+    }
+
+    let total: Int
+    if modelUnavailable {
+        var approxTotal = await TokenCounter.shared.count(mergedPrompt)
+        if let sys = systemPrompt, !sys.isEmpty {
+            approxTotal += await TokenCounter.shared.count(sys)
+        }
+        total = approxTotal
+    } else {
+        total = await TokenCounter.shared.count(entries: inputEntries)
+    }
+
+    var promptParts: [String] = []
+    if let piped = pipedContent, !piped.isEmpty { promptParts.append(piped) }
+    if !positionalPrompt.isEmpty { promptParts.append(positionalPrompt) }
+    let promptText = promptParts.joined(separator: "\n\n")
+    let promptTokens = await TokenCounter.shared.count(promptText)
+
+    let systemTokens: Int
+    if let sys = systemPrompt, !sys.isEmpty {
+        systemTokens = await TokenCounter.shared.count(sys)
+    } else {
+        systemTokens = 0
+    }
+
+    var fileTokenCounts: [FileTokenCount] = []
+    for attachment in fileAttachments {
+        let tokens = await TokenCounter.shared.count(attachment.content)
+        fileTokenCounts.append(FileTokenCount(path: attachment.path, tokens: tokens))
+    }
+
+    let mcpToolTokens: Int
+    if modelUnavailable {
+        mcpToolTokens = 0
+    } else if let baseline = noToolEntries {
+        let baselineCount = await TokenCounter.shared.count(entries: baseline)
+        mcpToolTokens = max(0, total - baselineCount)
+    } else {
+        mcpToolTokens = 0
+    }
+
+    // The pre-flight decision can be wrong at runtime: tokenCount(for:) can
+    // throw, or availability can flip between the check and the counts. The
+    // counter records any actual fallback so the report never claims exact
+    // numbers that were really chars/4 (#327).
+    let runtimeFellBack = await TokenCounter.shared.runtimeFellBack
+    let fellBackAtRuntime = tokenCountFallback == nil && runtimeFellBack
+
+    let report = TokenBudgetReport.make(
+        promptTokens: promptTokens,
+        systemTokens: systemTokens,
+        fileTokens: fileTokenCounts,
+        mcpToolTokens: mcpToolTokens,
+        total: total,
+        contextSize: contextSize,
+        outputReserve: outputReserve,
+        approximate: approximate || fellBackAtRuntime
+    )
+
+    if let tokenCountFallback, !quietMode {
+        printStderr("\(styledErr("apfel:", .yellow)) \(tokenCountFallback.message)")
+    } else if fellBackAtRuntime, !quietMode {
+        printStderr("\(styledErr("apfel:", .yellow)) token count is approximate (the on-device tokenizer failed at runtime; using chars/4 fallback)")
+    }
+
+    switch outputFormat {
+    case .plain:
+        let fitLabel = report.fits ? "fits" : "over budget"
+        print("\(report.total)/\(report.budget) tokens (\(fitLabel))")
+        if !quietMode {
+            var parts: [String] = []
+            if report.promptTokens > 0 { parts.append("prompt=\(report.promptTokens)") }
+            if report.systemTokens > 0 { parts.append("system=\(report.systemTokens)") }
+            for ft in report.fileTokens where ft.tokens > 0 {
+                parts.append("\(ft.path)=\(ft.tokens)")
+            }
+            if report.mcpToolTokens > 0 { parts.append("mcp_tools=\(report.mcpToolTokens)") }
+            if !parts.isEmpty {
+                printStderr(styledErr("  " + parts.joined(separator: ", "), .dim))
+            }
+        }
+    case .json:
+        print(jsonString(TokenBudgetJSONResponse(report: report), pretty: false))
+        fflush(stdout)
+    }
+
+    return report
 }
 
 // MARK: - Interactive Chat
 
 /// Run an interactive multi-turn chat session with context window protection.
-func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager: MCPManager? = nil) async throws {
+func chat(systemPrompt: String?, initialContext: String? = nil, options: SessionOptions = .defaults, mcpManager: MCPManager? = nil, contextStatus: Bool = false) async throws {
     guard isatty(STDIN_FILENO) != 0 else {
         printError("--chat requires an interactive terminal (stdin must be a TTY)")
         exit(exitUsageError)
     }
+
+    // `-f file` (and any positional prompt) seed the conversation: the extracted
+    // content is folded into the session instructions so the model already has
+    // it in context on the first turn. Before #370 the .chat dispatch dropped
+    // this content silently. Folding into instructions (rather than a dangling
+    // user turn) keeps the transcript well-formed for the first respond() call.
+    let contextPreamble: String? = {
+        guard let seed = initialContext, !seed.isEmpty else { return nil }
+        return "The following is content the user attached for reference. Use it to answer their questions:\n\n\(seed)\n\n(End of attached content.)"
+    }()
 
     // Keep SIGINT blocked while chat bootstraps so background threads spawned
     // during model/session setup do not inherit an unblocked Ctrl-C.
@@ -90,28 +399,39 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
     let model = makeModel(permissive: options.permissive)
     var session: LanguageModelSession
     if hasMCPTools {
-        // Build session directly with tool definitions in Instructions.
-        // Can't use ContextManager.makeSession() here because it requires a user message,
-        // and chat has no user message at init time (user hasn't typed anything yet).
-        let converted = await SchemaConverter.convert(tools: mcpTools)
+        // Build session with ALL tool schemas as text instructions and NO native
+        // toolDefinitions. Native defs cause the FoundationModels framework to
+        // intercept tool calls instead of surfacing them as text in the stream.
+        // apfel uses out-of-band text detection (ToolCallHandler.detectToolCall),
+        // so native interception breaks tool execution in chat mode (#144).
         var instrParts: [String] = []
         if let sys = systemPrompt { instrParts.append(sys) }
+        if let pre = contextPreamble { instrParts.append(pre) }
         let toolNames = mcpTools.map { $0.function.name }
         instrParts.append(ToolCallHandler.buildOutputFormatInstructions(toolNames: toolNames))
         instrParts.append("IMPORTANT: You may ONLY call the functions listed above (\(toolNames.joined(separator: ", "))). Do NOT invent function names. If the user's request cannot be handled by these specific functions, respond with plain text.")
-        if !converted.fallback.isEmpty {
-            instrParts.append(ToolCallHandler.buildFallbackPrompt(tools: converted.fallback))
-        }
+        let allToolDefs = mcpTools.map { ToolDef(name: $0.function.name, description: $0.function.description, parametersJSON: $0.function.parameters?.value) }
+        instrParts.append(ToolCallHandler.buildFallbackPrompt(tools: allToolDefs))
         let instrText = instrParts.joined(separator: "\n\n")
         let segments: [Transcript.Segment] = [.text(Transcript.TextSegment(content: instrText))]
-        let instr = Transcript.Instructions(segments: segments, toolDefinitions: converted.native)
+        let instr = Transcript.Instructions(segments: segments, toolDefinitions: [])
         session = makeTranscriptSession(model: model, entries: [.instructions(instr)])
-        debugLog("chat", "session created with \(converted.native.count) native + \(converted.fallback.count) fallback tools")
+        debugLog("chat", "session created with \(mcpTools.count) text-injected tools")
     } else {
-        session = makeSession(systemPrompt: systemPrompt, options: options)
+        let combinedSystem = [systemPrompt, contextPreamble]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        session = makeSession(systemPrompt: combinedSystem.isEmpty ? nil : combinedSystem, options: options)
     }
     let genOpts = makeGenerationOptions(options)
-    let lineEditor = ChatLineEditor(outputFormat: outputFormat)
+    // Persistent history is opt-in via APFEL_HISTFILE (off by default). The
+    // path decision is a pure, unit-tested policy in ApfelCLI (#259).
+    let historyFile = ChatHistory.filePath(env: ProcessInfo.processInfo.environment)
+    let lineEditor = ChatLineEditor(
+        outputFormat: outputFormat,
+        historyLimit: ChatHistory.maxEntries,
+        historyFile: historyFile)
     var turn = 0
 
     printHeader()
@@ -124,6 +444,14 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
                 print(sysLine)
             }
         }
+        if let seed = initialContext, !seed.isEmpty {
+            let ctxLine = styled("context: ", .magenta, .bold) + styled("loaded \(seed.count) chars into the conversation", .dim)
+            if outputFormat == .json {
+                printStderr(ctxLine)
+            } else {
+                print(ctxLine)
+            }
+        }
         let hint = styled("Type 'quit' to exit.\n", .dim)
         if outputFormat == .json {
             printStderr(hint)
@@ -132,6 +460,12 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
         }
     }
 
+    // Set when context rotation fails mid-session (e.g. --context-strategy
+    // strict over budget). Captured here and rethrown after the loop so the
+    // top-level handler maps it to a nonzero exit; a plain `throw` inside the
+    // turn body would be swallowed by the per-turn model-error catch and the
+    // session would exit 0 as if it ended cleanly (#252).
+    var rotationError: Error?
     while true {
         let prompt = quietMode ? "" : "you› "
         guard let input = lineEditor.readLine(prompt: prompt) else { break }
@@ -178,38 +512,25 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
             let transcript = session.transcript
             let tokenCount = await TokenCounter.shared.count(entries: transcriptEntries(transcript))
             let budget = await TokenCounter.shared.inputBudget(reservedForOutput: options.contextConfig.outputReserve)
+            if contextStatus && !quietMode {
+                printContextStatus(tokenCount: tokenCount, budget: budget)
+            }
             if tokenCount > budget {
                 do {
                     let truncated = try await truncateTranscript(transcript, budget: budget, config: options.contextConfig)
-                    if hasMCPTools {
-                        // Re-inject MCP tool definitions into the truncated transcript.
-                        // Without this, tools silently stop working after context rotation.
-                        let truncEntries = transcriptEntries(truncated)
-                        var rebuilt: [Transcript.Entry] = []
-                        let converted = await SchemaConverter.convert(tools: mcpTools)
-                        if let first = truncEntries.first, case .instructions(let instr) = first {
-                            let updated = Transcript.Instructions(
-                                segments: instr.segments, toolDefinitions: converted.native)
-                            rebuilt.append(.instructions(updated))
-                            rebuilt.append(contentsOf: truncEntries.dropFirst())
-                        } else {
-                            let toolInstr = Transcript.Instructions(
-                                segments: [], toolDefinitions: converted.native)
-                            rebuilt.append(.instructions(toolInstr))
-                            rebuilt.append(contentsOf: truncEntries)
-                        }
-                        session = makeTranscriptSession(model: model, entries: rebuilt)
-                        debugLog("context", "rotated with MCP tools re-injected (\(converted.native.count) native)")
-                    } else {
-                        session = LanguageModelSession(model: model, transcript: truncated)
-                        debugLog("context", "rotated (no MCP tools)")
-                    }
+                    // Tool schemas live in the Instructions text segments (not native
+                    // toolDefinitions), so they survive truncation without re-injection.
+                    session = LanguageModelSession(model: model, transcript: truncated)
+                    debugLog("context", "rotated\(hasMCPTools ? " (tool text preserved)" : "")")
                     if !quietMode && outputFormat == .plain {
                         print(styled("  [context rotated — \(options.contextConfig.strategy.rawValue)]", .dim))
                     }
                 } catch {
-                    let classified = ApfelError.classify(error)
-                    printError("\(classified.cliLabel) \(classified.openAIMessage)")
+                    // Context rotation failed (e.g. --context-strategy strict with
+                    // history over budget throws contextOverflow). Capture it and
+                    // leave the loop; it is rethrown below so main.swift maps it via
+                    // exitCode(for:) to a nonzero exit instead of exiting 0 (#252).
+                    rotationError = error
                     break
                 }
             }
@@ -219,6 +540,8 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
         }
     }
 
+    if let rotationError { throw rotationError }
+
     if !quietMode {
         let bye = styled("\nGoodbye.", .dim)
         if outputFormat == .json {
@@ -226,6 +549,17 @@ func chat(systemPrompt: String?, options: SessionOptions = .defaults, mcpManager
         } else {
             print(bye)
         }
+    }
+}
+
+func printContextStatus(tokenCount: Int, budget: Int) {
+    let percent = budget > 0 ? min(999, (tokenCount * 100) / budget) : 0
+    let remaining = max(0, budget - tokenCount)
+    let line = styled("  [context \(tokenCount)/\(budget) tokens, \(percent)%, \(remaining) remaining]", .dim)
+    if outputFormat == .json {
+        printStderr(line)
+    } else {
+        print(line)
     }
 }
 
@@ -318,6 +652,35 @@ func printRelease() {
     """)
 }
 
+// MARK: - Demos
+
+/// Write the bundled demo scripts to a directory. Because the demos are
+/// embedded in the binary, this behaves identically across homebrew-core, the
+/// tap, and source builds - there is no brew `--with-demo` option that could.
+/// Returns a process exit code.
+func runDemosInstall(target: String?) -> Int32 {
+    let dirPath = target ?? "apfel-demos"
+    let dir = URL(fileURLWithPath: dirPath)
+    do {
+        let installed = try DemoInstaller.install(into: dir)
+        let resolved = dir.path
+        print("\(styled("apfel:", .green, .bold)) wrote \(installed.count) demo files to \(styled(resolved, .cyan))")
+        for demo in installed where demo.executable {
+            print("  \(styled("•", .dim)) \(demo.name)")
+        }
+        print("")
+        print("Try one:")
+        print("  \(styled("\(resolved)/cmd", .cyan)) \"find files larger than 100MB\"")
+        print("  \(styled("cat", .dim)) README.md | \(styled("\(resolved)/explain", .cyan)) ")
+        print("")
+        print("See \(styled("\(resolved)/README.md", .cyan)) for what each demo does.")
+        return exitSuccess
+    } catch {
+        printError("could not write demos to \(dirPath): \(error)")
+        return exitRuntimeError
+    }
+}
+
 // MARK: - Self-Update
 
 /// Check for updates and optionally run `brew upgrade apfel`.
@@ -327,11 +690,26 @@ func performUpdate() {
     let execPath = ProcessInfo.processInfo.arguments[0]
     let resolved = (execPath as NSString).resolvingSymlinksInPath
 
-    let isBrew = resolved.contains("/homebrew/Cellar/apfel/") || resolved.contains("/homebrew/opt/apfel/")
+    let installMethod = detectInstallMethod(binaryPath: resolved)
 
-    if isBrew {
+    // Derive the Homebrew prefix from the resolved binary path instead of
+    // hardcoding /opt/homebrew, so a non-default prefix (Intel /usr/local, a
+    // custom ~/homebrew, etc.) works. Fall back to a PATH lookup of brew (#260).
+    let brewExec = homebrewPrefix(fromBinaryPath: resolved).map { "\($0)/bin/brew" }
+        ?? findExecutableInPath("brew")
+        ?? "brew"
+    let apfelExec = homebrewPrefix(fromBinaryPath: resolved).map { "\($0)/bin/apfel" }
+        ?? findExecutableInPath("apfel")
+        ?? resolved
+
+    switch installMethod {
+    case .homebrew:
         print("\(appName) v\(current) (installed via Homebrew)")
-    } else {
+    case .macports:
+        print("\(appName) v\(current) (installed via MacPorts)")
+        print("To update: sudo port sync && sudo port update apfel")
+        return
+    case .source:
         print("\(appName) v\(current) (installed from source)")
         print("To update: git pull && make install")
         print("Or visit: https://github.com/Arthur-Ficial/apfel/releases")
@@ -339,8 +717,8 @@ func performUpdate() {
     }
 
     // Check for updates via brew
-    let outdatedJSON = shellOutput("/opt/homebrew/bin/brew", args: ["info", "--json=v2", "apfel"])
-    guard let data = outdatedJSON.data(using: .utf8),
+    guard let outdatedJSON = shellOutput(brewExec, args: ["info", "--json=v2", "apfel"]),
+          let data = outdatedJSON.data(using: .utf8),
           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let formulae = json["formulae"] as? [[String: Any]],
           let formula = formulae.first,
@@ -373,30 +751,29 @@ func performUpdate() {
     }
 
     print(styled("Running: brew upgrade apfel", .dim))
-    let result = shellPassthrough("/opt/homebrew/bin/brew", args: ["upgrade", "apfel"])
+    let result = shellPassthrough(brewExec, args: ["upgrade", "apfel"])
     if result == 0 {
-        let newVersion = shellOutput("/opt/homebrew/bin/apfel", args: ["--version"]).trimmingCharacters(in: .whitespacesAndNewlines)
-        print(styled("Updated to \(newVersion)", .green))
+        if let newVersion = shellOutput(apfelExec, args: ["--version"])?.trimmingCharacters(in: .whitespacesAndNewlines), !newVersion.isEmpty {
+            print(styled("Updated to \(newVersion)", .green))
+        } else {
+            print(styled("Upgrade complete.", .green))
+        }
     } else {
         printError("brew upgrade failed (exit \(result)). Try manually: brew upgrade apfel")
     }
 }
 
-/// Run a command and capture stdout.
-private func shellOutput(_ executable: String, args: [String]) -> String {
-    let proc = Process()
-    let pipe = Pipe()
-    proc.executableURL = URL(fileURLWithPath: executable)
-    proc.arguments = args
-    proc.standardOutput = pipe
-    proc.standardError = FileHandle.nullDevice
-    do {
-        try proc.run()
-        proc.waitUntilExit()
-    } catch {
-        return ""
+/// Locate an executable by scanning `PATH`. Returns the first absolute path
+/// that exists and is executable, or nil. Used as a fallback for `brew`/`apfel`
+/// when the binary path is not a recognizable Homebrew layout (#260).
+private func findExecutableInPath(_ name: String) -> String? {
+    guard let pathVar = ProcessInfo.processInfo.environment["PATH"] else { return nil }
+    let fm = FileManager.default
+    for dir in pathVar.split(separator: ":", omittingEmptySubsequences: true) {
+        let candidate = "\(dir)/\(name)"
+        if fm.isExecutableFile(atPath: candidate) { return candidate }
     }
-    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return nil
 }
 
 /// Run a command with stdout/stderr passed through to the terminal.
@@ -416,27 +793,48 @@ private func shellPassthrough(_ executable: String, args: [String]) -> Int32 {
 
 // MARK: - Usage
 
-/// Print the help text. Styled with ANSI colors when on a TTY.
-func printUsage() {
-    print("""
+/// Print the help/usage text to the given destination.
+///
+/// `--help`/`.help` prints to stdout and exits 0. Usage-error paths (exit 2)
+/// print to stderr so stdout stays empty for downstream pipes (#250). ANSI
+/// color is gated on the destination's own TTY-ness so a redirected error
+/// stream stays escape-free (see styledErr, #249).
+func printUsage(to handle: FileHandle = .standardOutput) {
+    let toStderr = handle === FileHandle.standardError
+    let colorize = ColorPolicy.shouldColorize(
+        isTTY: isatty(toStderr ? STDERR_FILENO : STDOUT_FILENO) != 0,
+        noColorEnv: noColorEnv,
+        noColorFlag: noColorFlag)
+    func styled(_ text: String, _ colors: ANSIColor...) -> String {
+        applyStyle(text, colorize: colorize, colors)
+    }
+    let text = """
     \(styled(appName, .cyan, .bold)) v\(version) — Apple Intelligence from the command line
 
     \(styled("USAGE:", .yellow, .bold))
       \(appName) [OPTIONS] <prompt>       Send a single prompt
+      \(appName) [OPTIONS] -- <prompt>    "--" ends options; prompt may start with "-"
       \(appName) -f <file> <prompt>       Attach file content to prompt
       \(appName) --chat                   Interactive conversation
       \(appName) --stream <prompt>        Stream a single response
       \(appName) --serve                  Start OpenAI-compatible HTTP server
       \(appName) --benchmark              Run internal performance benchmarks
+      \(appName) --count-tokens <prompt>  Preflight token count (no inference)
+      \(appName) completions <shell>      Print shell completions (bash, zsh, fish)
 
     \(styled("OPTIONS:", .yellow, .bold))
       -f, --file <path>         Attach file content to prompt (repeatable)
       -s, --system <text>       Set a system prompt
           --system-file <path>  Read system prompt from file
+          --schema <path>       Constrain output to a JSON Schema file (guaranteed valid JSON)
+          --messages <path|->   One-shot multi-turn: OpenAI messages JSON from file or stdin
+          --code                Print only the code: first fenced block, or the bare
+                                response when unfenced. Exit 7 on an empty response
       -o, --output <format>     Output format: plain, json [default: plain]
       -q, --quiet               Suppress non-essential output
           --no-color             Disable colored output
-          --temperature <n>      Sampling temperature (e.g., 0.7)
+          --temperature <n>      Sampling temperature (e.g., 0.7); 0 = deterministic
+          --top-p <n>            Nucleus sampling threshold in (0, 1] (e.g., 0.9)
           --seed <n>             Random seed for reproducible output
           --max-tokens <n>       Maximum response tokens
           --mcp <path|url>       Attach local or remote MCP tool server (repeatable)
@@ -444,9 +842,14 @@ func printUsage() {
           --mcp-timeout <n>      MCP server timeout in seconds [default: 5]
           --permissive           Use permissive content guardrails
           --retry [n]            Enable retry with exponential backoff [default: 3 retries]
+                                 Ambiguous with a numeric prompt: `--retry 7` alone keeps
+                                 "7" as the prompt; use --retry=N to set the count unambiguously
           --model-info           Print model capabilities and exit
           --benchmark            Run internal performance benchmarks
+          --count-tokens         Count tokens without calling the model
+          --strict               With --count-tokens: exit 4 if over budget
           --update               Check for updates and upgrade via Homebrew
+          --demos [dir]          Write the bundled demo scripts to dir [default: ./apfel-demos]
           --debug                Enable debug logging to stderr (all modes)
       -h, --help                Show this help
       -v, --version             Print version
@@ -459,6 +862,7 @@ func printUsage() {
           --context-max-turns <n> Max history turns (sliding-window only)
           --context-output-reserve <n>
                                   Tokens reserved for output [default: 512]
+          --context-status     Print chat context fill after each turn
 
     \(styled("SERVER OPTIONS:", .yellow, .bold))
           --serve                Start OpenAI-compatible HTTP server
@@ -477,8 +881,9 @@ func printUsage() {
 
     \(styled("ENVIRONMENT:", .yellow, .bold))
       APFEL_SYSTEM_PROMPT       Default system prompt
-      APFEL_MCP                 MCP server paths (colon-separated)
+      APFEL_MCP                 MCP server paths (comma-separated; colon accepted for local paths)
       APFEL_MCP_TIMEOUT         MCP timeout in seconds [default: 5]
+      APFEL_MCP_TOKEN           Bearer token for remote MCP servers
       APFEL_HOST                Server bind address [default: 127.0.0.1]
       APFEL_PORT                Server port [default: 11434]
       APFEL_TOKEN               Bearer token for server authentication
@@ -488,6 +893,8 @@ func printUsage() {
       APFEL_CONTEXT_MAX_TURNS   Max turns for sliding-window
       APFEL_CONTEXT_OUTPUT_RESERVE
                                 Tokens reserved for output
+      APFEL_DEBUG               Enable debug logging (same as --debug)
+      APFEL_HISTFILE            Persist --chat history to this file (off by default)
       NO_COLOR                  Disable colored output (https://no-color.org)
 
     \(styled("EXIT CODES:", .yellow, .bold))
@@ -498,6 +905,7 @@ func printUsage() {
       4  Context overflow (input too long)
       5  Model unavailable (Apple Intelligence not enabled)
       6  Rate limited / busy
+      130  Interrupted (Ctrl-C at the chat prompt)
 
     \(styled("EXAMPLES:", .yellow, .bold))
       \(appName) "What is the capital of Austria?"
@@ -509,7 +917,10 @@ func printUsage() {
       \(appName) -f a.txt -f b.txt "Compare these files"
       cat README.md | \(appName) "Summarize this"
       \(appName) -o json "Translate to German: hello" | jq .content
+      \(appName) --count-tokens -f README.md "Summarize this"
+      \(appName) --count-tokens -o json "hello" | jq .
       APFEL_SYSTEM_PROMPT="Be brief" \(appName) "Explain TCP"
       \(appName) --serve --port 3000 --host 0.0.0.0 --cors
-    """)
+    """
+    handle.write(Data((text + "\n").utf8))
 }

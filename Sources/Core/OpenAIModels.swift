@@ -5,35 +5,123 @@
 
 import Foundation
 
-public struct ChatCompletionRequest: Decodable, Sendable {
+/// OpenAI-compatible chat-completions request payload.
+public struct ChatCompletionRequest: Decodable, Sendable, Equatable, Hashable {
+    /// The requested model name. ApfelCore accepts `apple-foundationmodel`.
     public let model: String
+    /// The conversation transcript sent to the model.
     public let messages: [OpenAIMessage]
+    /// Whether the caller requested streaming chunks.
     public let stream: Bool?
+    /// Streaming-specific configuration.
+    public let stream_options: StreamOptions?
+    /// Sampling temperature override.
     public let temperature: Double?
+    /// Nucleus (top-p) sampling threshold override.
+    public let top_p: Double?
+    /// Maximum completion tokens requested by the client.
     public let max_tokens: Int?
+    /// Optional deterministic seed request.
     public let seed: Int?
+    /// Client-supplied tool definitions.
     public let tools: [OpenAITool]?
+    /// How the client wants tool choice resolved.
     public let tool_choice: ToolChoice?
+    /// Requested response-format contract.
     public let response_format: ResponseFormat?
+    /// OpenAI logprobs request flag.
     public let logprobs: Bool?
+    /// Number of requested completions.
     public let n: Int?
+    /// Raw stop-sequence payload.
     public let stop: RawJSON?
+    /// OpenAI presence-penalty override.
     public let presence_penalty: Double?
+    /// OpenAI frequency-penalty override.
     public let frequency_penalty: Double?
+    /// End-user identifier forwarded by the client.
     public let user: String?
+    /// Requested context-trimming strategy override.
     public let x_context_strategy: String?
+    /// Requested maximum conversation turns after trimming.
     public let x_context_max_turns: Int?
+    /// Requested token reserve for the model's output.
     public let x_context_output_reserve: Int?
+
+    /// Creates a chat-completions request value.
+    public init(
+        model: String,
+        messages: [OpenAIMessage],
+        stream: Bool? = nil,
+        stream_options: StreamOptions? = nil,
+        temperature: Double? = nil,
+        top_p: Double? = nil,
+        max_tokens: Int? = nil,
+        seed: Int? = nil,
+        tools: [OpenAITool]? = nil,
+        tool_choice: ToolChoice? = nil,
+        response_format: ResponseFormat? = nil,
+        logprobs: Bool? = nil,
+        n: Int? = nil,
+        stop: RawJSON? = nil,
+        presence_penalty: Double? = nil,
+        frequency_penalty: Double? = nil,
+        user: String? = nil,
+        x_context_strategy: String? = nil,
+        x_context_max_turns: Int? = nil,
+        x_context_output_reserve: Int? = nil
+    ) {
+        self.model = model
+        self.messages = messages
+        self.stream = stream
+        self.stream_options = stream_options
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self.seed = seed
+        self.tools = tools
+        self.tool_choice = tool_choice
+        self.response_format = response_format
+        self.logprobs = logprobs
+        self.n = n
+        self.stop = stop
+        self.presence_penalty = presence_penalty
+        self.frequency_penalty = frequency_penalty
+        self.user = user
+        self.x_context_strategy = x_context_strategy
+        self.x_context_max_turns = x_context_max_turns
+        self.x_context_output_reserve = x_context_output_reserve
+    }
 }
 
-public struct OpenAIMessage: Codable, Sendable, Equatable {
-    public let role: String
-    public let content: MessageContent?
-    public let tool_calls: [ToolCall]?
-    public let tool_call_id: String?
-    public let name: String?
-    public let refusal: String?      // required by OpenAI spec, always null for our model
+/// OpenAI `stream_options` payload.
+public struct StreamOptions: Decodable, Sendable, Equatable, Hashable {
+    /// Whether streaming responses should include a usage block.
+    public let include_usage: Bool?
 
+    /// Creates streaming options.
+    public init(include_usage: Bool? = nil) {
+        self.include_usage = include_usage
+    }
+}
+
+/// OpenAI-compatible chat message.
+public struct OpenAIMessage: Codable, Sendable, Equatable, Hashable {
+    /// The OpenAI role string, such as `system`, `user`, `assistant`, or `tool`.
+    public let role: String
+    /// The message body, either as plain text or structured content parts.
+    public let content: MessageContent?
+    /// Tool calls requested by an assistant message.
+    public let tool_calls: [ToolCall]?
+    /// Tool-call identifier for tool-role messages.
+    public let tool_call_id: String?
+    /// Optional sender name.
+    public let name: String?
+    /// OpenAI refusal text. Populated on assistant messages when the model
+    /// refuses; encoded as null when absent.
+    public let refusal: String?
+
+    /// Creates an OpenAI-compatible message value.
     public init(
         role: String,
         content: MessageContent?,
@@ -54,6 +142,7 @@ public struct OpenAIMessage: Codable, Sendable, Equatable {
     // assistant-role response messages (as null when absent). Swift's
     // synthesized Encodable omits nil optionals, so we encode manually.
     // Decoding still uses the synthesized init (content/refusal are Optional).
+    /// Encodes the message using OpenAI-compatible null-handling rules.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(role, forKey: .role)
@@ -67,8 +156,13 @@ public struct OpenAIMessage: Codable, Sendable, Equatable {
         try c.encodeIfPresent(tool_calls, forKey: .tool_calls)
         try c.encodeIfPresent(tool_call_id, forKey: .tool_call_id)
         try c.encodeIfPresent(name, forKey: .name)
-        // refusal: always present in responses (null when absent)
-        try c.encodeNil(forKey: .refusal)
+        // refusal: always present in responses (string when the model refused,
+        // null otherwise). OpenAI wire-format parity for content_filter.
+        if let refusal = refusal {
+            try c.encode(refusal, forKey: .refusal)
+        } else {
+            try c.encodeNil(forKey: .refusal)
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -97,16 +191,43 @@ public struct OpenAIMessage: Codable, Sendable, Equatable {
         }
     }
 
+    /// Whether the message contains image parts.
     public var containsImageContent: Bool {
         guard case .parts(let parts) = content else { return false }
         return parts.contains(where: { $0.type == "image_url" })
     }
 }
 
-public enum MessageContent: Codable, Sendable, Equatable {
+extension Array where Element == OpenAIMessage {
+    /// Roles that address the model rather than take a turn in the
+    /// conversation. FoundationModels has a single instructions slot, so both
+    /// are folded into it (#390, #405).
+    public static var instructionRoles: Set<String> { ["system", "developer"] }
+
+    /// Text content of every instruction-role message, in order, joined with
+    /// double newlines. Returns nil when none carries non-empty text.
+    ///
+    /// Every one of them, not just the first: SDKs and agent frameworks
+    /// routinely stack a base prompt and a task-specific one, and dropping the
+    /// rest answered against instructions the caller believed were in force
+    /// (#390).
+    public var joinedInstructionContent: String? {
+        let parts = self
+            .filter { Self.instructionRoles.contains($0.role) }
+            .compactMap(\.textContent)
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n\n")
+    }
+}
+
+/// OpenAI-compatible message content.
+public enum MessageContent: Codable, Sendable, Equatable, Hashable {
+    /// Plain text content.
     case text(String)
+    /// Structured content parts.
     case parts([ContentPart])
 
+    /// Decodes either a plain string or an array of structured parts.
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let text = try? container.decode(String.self) {
@@ -116,6 +237,7 @@ public enum MessageContent: Codable, Sendable, Equatable {
         self = .parts(try container.decode([ContentPart].self))
     }
 
+    /// Encodes the content in its wire-compatible representation.
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
         switch self {
@@ -127,31 +249,44 @@ public enum MessageContent: Codable, Sendable, Equatable {
     }
 }
 
-public struct ContentPart: Codable, Sendable, Equatable {
+/// One structured content part within an OpenAI message.
+public struct ContentPart: Codable, Sendable, Equatable, Hashable {
+    /// The OpenAI part type, such as `text` or `image_url`.
     public let type: String
+    /// The text payload for text parts.
     public let text: String?
 
+    /// Creates a content part.
     public init(type: String, text: String?) {
         self.type = type
         self.text = text
     }
 }
 
-public struct OpenAITool: Decodable, Sendable {
+/// OpenAI-compatible tool definition.
+public struct OpenAITool: Decodable, Sendable, Equatable, Hashable {
+    /// The tool type. OpenAI-compatible tool-calling uses `function`.
     public let type: String
+    /// The function-style tool metadata.
     public let function: OpenAIFunction
 
+    /// Creates a tool definition.
     public init(type: String, function: OpenAIFunction) {
         self.type = type
         self.function = function
     }
 }
 
-public struct OpenAIFunction: Decodable, Sendable {
+/// OpenAI-compatible function definition nested under a tool.
+public struct OpenAIFunction: Decodable, Sendable, Equatable, Hashable {
+    /// The function name.
     public let name: String
+    /// Human-readable tool description.
     public let description: String?
+    /// Raw JSON Schema parameters for the tool.
     public let parameters: RawJSON?
 
+    /// Creates a function definition.
     public init(name: String, description: String?, parameters: RawJSON?) {
         self.name = name
         self.description = description
@@ -160,13 +295,16 @@ public struct OpenAIFunction: Decodable, Sendable {
 }
 
 /// Stores arbitrary JSON as a raw string — used for tool parameter schemas.
-public struct RawJSON: Decodable, Sendable, Equatable {
+public struct RawJSON: Decodable, Sendable, Equatable, Hashable {
+    /// The raw JSON text.
     public let value: String
 
+    /// Creates a raw JSON wrapper from already-serialized JSON text.
     public init(rawValue: String) {
         self.value = rawValue
     }
 
+    /// Decodes arbitrary JSON and stores its canonical serialized form.
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         let raw = try container.decode(AnyCodable.self)
@@ -175,11 +313,16 @@ public struct RawJSON: Decodable, Sendable, Equatable {
     }
 }
 
-public struct ToolCall: Codable, Sendable, Equatable {
+/// OpenAI-compatible tool-call payload.
+public struct ToolCall: Codable, Sendable, Equatable, Hashable {
+    /// Stable tool-call identifier.
     public let id: String
+    /// The tool-call type. OpenAI-compatible tool-calling uses `function`.
     public let type: String
+    /// Function invocation details.
     public let function: ToolCallFunction
 
+    /// Creates a tool call.
     public init(id: String, type: String, function: ToolCallFunction) {
         self.id = id
         self.type = type
@@ -187,32 +330,51 @@ public struct ToolCall: Codable, Sendable, Equatable {
     }
 }
 
-public struct ToolCallFunction: Codable, Sendable, Equatable {
+/// OpenAI-compatible function invocation payload.
+public struct ToolCallFunction: Codable, Sendable, Equatable, Hashable {
+    /// The function name to invoke.
     public let name: String
+    /// JSON-encoded argument object as a string.
     public let arguments: String
 
+    /// Creates a function invocation payload.
     public init(name: String, arguments: String) {
         self.name = name
         self.arguments = arguments
     }
 }
 
-public enum ToolChoice: Decodable, Sendable, Equatable {
+/// OpenAI-compatible tool choice request.
+public enum ToolChoice: Decodable, Sendable, Equatable, Hashable {
+    /// Let the model decide whether to call tools.
     case auto
+    /// Do not allow tool calls.
     case none
+    /// Require the model to call a tool.
     case required
+    /// Force a specific tool name.
     case specific(name: String)
+    /// An unrecognized string or undecodable object. Rejected by the validator
+    /// with a 400 instead of being silently coerced to `.auto` (#238).
+    case invalid(String)
 
+    /// Decodes the OpenAI string-or-object tool choice format.
+    ///
+    /// Unrecognized values decode to `.invalid` rather than throwing, so the
+    /// validator can return a specific `invalid_request_error` (a thrown
+    /// DecodingError here would surface as a generic "Invalid JSON" 400).
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let string = try? container.decode(String.self) {
             switch string {
+            case "auto":
+                self = .auto
             case "none":
                 self = .none
             case "required":
                 self = .required
             default:
-                self = .auto
+                self = .invalid(string)
             }
             return
         }
@@ -230,35 +392,132 @@ public enum ToolChoice: Decodable, Sendable, Equatable {
             return
         }
 
-        self = .auto
+        self = .invalid("<object>")
     }
 }
 
-public struct ResponseFormat: Decodable, Sendable, Equatable {
+/// OpenAI-compatible response-format request.
+public struct ResponseFormat: Decodable, Sendable, Equatable, Hashable {
+    /// The requested response format type, such as `text`, `json_object`, or
+    /// `json_schema`.
     public let type: String
+    /// The `json_schema` payload, present only when `type == "json_schema"`.
+    public let json_schema: JSONSchemaSpec?
+
+    /// Creates a response-format request.
+    public init(type: String, json_schema: JSONSchemaSpec? = nil) {
+        self.type = type
+        self.json_schema = json_schema
+    }
+}
+
+/// OpenAI `response_format.json_schema` payload — a named JSON Schema the model
+/// output must conform to (guaranteed structured outputs).
+public struct JSONSchemaSpec: Decodable, Sendable, Equatable, Hashable {
+    /// The schema name (used as the root schema's name).
+    public let name: String
+    /// The raw JSON Schema the output must conform to.
+    public let schema: RawJSON?
+    /// Whether strict conformance is requested. apfel always generates against
+    /// the schema, so this is accepted and recorded but does not change behaviour.
+    public let strict: Bool?
+
+    /// Creates a JSON-schema response-format spec.
+    public init(name: String, schema: RawJSON?, strict: Bool? = nil) {
+        self.name = name
+        self.schema = schema
+        self.strict = strict
+    }
 }
 
 // MARK: - Type-erased Codable for raw JSON schemas
 
 struct AnyCodable: Codable, Sendable {
+    /// Maximum JSON nesting depth accepted for a caller-supplied raw JSON value.
+    ///
+    /// `init(from:)` recurses once per level, and the server decodes request
+    /// bodies on a cooperative-pool thread whose stack is far smaller than the
+    /// ~512-level limit Foundation's own JSON scanner enforces. Depths in
+    /// between passed the scanner and then exhausted the stack, aborting the
+    /// whole process with SIGBUS on a ~1.3 KB unauthenticated POST. 64 levels
+    /// is well beyond any real JSON Schema (#462).
+    static let maxNestingDepth = 64
+
+    /// Marker carried in the thrown `DecodingError`'s `underlyingError`.
+    ///
+    /// The container probes below swallow "this value is not that type"
+    /// failures, which is what makes them probes. They must not swallow a
+    /// depth failure: doing so truncates the caller's schema to `null` and
+    /// answers 200 instead of 400, turning a crash into silent data loss. The
+    /// thrown error stays a real `DecodingError` so every existing
+    /// `catch is DecodingError` -- ours and downstream consumers' -- still
+    /// sees it and still produces a 400 (#462).
+    private struct NestingLimitExceeded: Error {}
+
     let value: (any Sendable)?
 
     init(from decoder: Decoder) throws {
+        guard decoder.codingPath.count <= Self.maxNestingDepth else {
+            throw Self.nestingLimitError(codingPath: decoder.codingPath)
+        }
         let container = try decoder.singleValueContainer()
         if container.decodeNil()                                    { value = nil; return }
         if let bool = try? container.decode(Bool.self)              { value = bool; return }
         if let int = try? container.decode(Int.self)                { value = int; return }
         if let double = try? container.decode(Double.self)          { value = double; return }
         if let string = try? container.decode(String.self)          { value = string; return }
-        if let object = try? container.decode([String: AnyCodable].self) {
+        if let object = try Self.probe([String: AnyCodable].self, in: container) {
             value = object
             return
         }
-        if let array = try? container.decode([AnyCodable].self) {
+        if let array = try Self.probe([AnyCodable].self, in: container) {
             value = array
             return
         }
-        value = nil
+        // Every JSON value is null, bool, int, double, string, object or array,
+        // and `null` was handled by decodeNil() above -- so reaching here means
+        // the input is not representable, in practice a number outside Double's
+        // range. The old unconditional `value = nil` fallback re-encoded it as
+        // the literal `null`, so `{"maximum": 1e999}` silently became
+        // `{"maximum": null}`: the schema apfel applied was not the schema the
+        // caller sent, and nothing in the request or response said so. Fail
+        // loudly instead (#455).
+        throw DecodingError.dataCorruptedError(
+            in: container,
+            debugDescription: "Value is not representable as JSON (numbers must fit in a Double)"
+        )
+    }
+
+    private static func nestingLimitError(codingPath: [any CodingKey]) -> DecodingError {
+        DecodingError.dataCorrupted(
+            DecodingError.Context(
+                codingPath: codingPath,
+                debugDescription:
+                    "JSON nesting exceeds the maximum supported depth of \(maxNestingDepth)",
+                underlyingError: NestingLimitExceeded()
+            )
+        )
+    }
+
+    private static func isNestingLimit(_ error: any Error) -> Bool {
+        guard case .dataCorrupted(let context)? = error as? DecodingError else { return false }
+        return context.underlyingError is NestingLimitExceeded
+    }
+
+    /// Decode `type`, returning `nil` when the value simply is not that type
+    /// but re-throwing a depth failure so it reaches the caller as a decoding
+    /// error instead of a silently null-ed subtree.
+    private static func probe<T: Decodable & Sendable>(
+        _ type: T.Type,
+        in container: any SingleValueDecodingContainer
+    ) throws -> T? {
+        do {
+            return try container.decode(type)
+        } catch where isNestingLimit(error) {
+            throw error
+        } catch {
+            return nil
+        }
     }
 
     func encode(to encoder: Encoder) throws {

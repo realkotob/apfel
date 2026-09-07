@@ -2,7 +2,7 @@
 
 ### The free AI already on your Mac.
 
-[![Version 0.9.18](https://img.shields.io/badge/version-0.9.18-blue)](https://github.com/Arthur-Ficial/apfel)
+[![Version 1.10.0](https://img.shields.io/badge/version-1.10.0-blue)](https://github.com/Arthur-Ficial/apfel)
 [![Swift 6.3+](https://img.shields.io/badge/Swift-6.3%2B-F05138?logo=swift&logoColor=white)](https://swift.org)
 [![macOS 26 Tahoe+](https://img.shields.io/badge/macOS-26%20Tahoe%2B-000000?logo=apple&logoColor=white)](https://developer.apple.com/macos/)
 [![No Xcode Required](https://img.shields.io/badge/Xcode-not%20required-orange)](https://developer.apple.com/xcode/resources/)
@@ -11,56 +11,52 @@
 [![Website](https://img.shields.io/badge/web-apfel.franzai.com-16A34A)](https://apfel.franzai.com)
 [![#agentswelcome](https://img.shields.io/badge/%23agentswelcome-PRs%20welcome-0066cc?style=for-the-badge&labelColor=0d1117&logo=probot&logoColor=white)](#contributing)
 
-Every Mac with Apple Silicon ships a built-in language model as part of Apple Intelligence. `apfel` gives you access to it — from the terminal, as a local OpenAI-compatible server, or as an interactive chat. No API keys, no cloud, no downloads. It's already on your machine.
-
-## What It Is
-
-Every Apple Silicon Mac with Apple Intelligence includes Apple's on-device foundation model. `apfel` exposes it through [https://developer.apple.com/documentation/foundationmodels](https://developer.apple.com/documentation/foundationmodels) so you can use it directly from the shell and from OpenAI-compatible clients.
+Apple Silicon Macs ship a built-in LLM via [Apple FoundationModels](https://developer.apple.com/documentation/foundationmodels). `apfel` exposes it as a UNIX tool and a local OpenAI-compatible server. 100% on-device. No API keys, no cloud.
 
 | Mode | Command | What you get |
 |------|---------|--------------|
 | UNIX tool | `apfel "prompt"` / `echo "text" \| apfel` | Pipe-friendly answers, file attachments, JSON output, exit codes |
 | OpenAI-compatible server | `apfel --serve` | Drop-in local `http://localhost:11434/v1` backend for OpenAI SDKs |
-| Command-line chat | `apfel --chat` | Multi-turn chat with context-window management |
 
-Tool calling works across CLI, chat, and server. Inference stays 100% on-device. The context window is 4096 tokens.
+`apfel --chat` - interactive REPL.
+
+Tool calling works in all contexts. On-device context window: 4096 tokens on macOS 26, 8192 on macOS 27 - read at runtime, see [Limitations](#limitations).
 
 ![apfel CLI](screenshots/cli.png)
 
 ## Requirements & Install
 
-- **macOS 26 Tahoe or newer**, Apple Silicon (M1+), and Apple Intelligence enabled: [https://support.apple.com/en-us/121115](https://support.apple.com/en-us/121115)
-- Building from source requires Command Line Tools with the macOS 26.4 SDK (Swift 6.3). No Xcode required.
-
-**Homebrew** (recommended):
+macOS 26 Tahoe+, Apple Silicon (M1+), [Apple Intelligence enabled](https://support.apple.com/en-us/121115).
 
 ```bash
-brew tap Arthur-Ficial/tap
 brew install apfel
+```
+
+Update:
+
+```bash
 brew upgrade apfel
 ```
 
-**Build from source:**
+Build from source (Command Line Tools with macOS 26.4 SDK / Swift 6.3, no Xcode):
 
 ```bash
-git clone https://github.com/Arthur-Ficial/apfel.git
-cd apfel
-make install
+git clone https://github.com/Arthur-Ficial/apfel.git && cd apfel && make install
 ```
 
-Update with `brew upgrade apfel` or `apfel --update`. Troubleshooting and Apple Intelligence setup notes: [docs/install.md](docs/install.md).
+Nix, same-day tap, Mint, mise, troubleshooting: [docs/install.md](docs/install.md).
 
 ## Quick Start
 
 ### UNIX tool
 
-Shell note: if your prompt contains `!`, prefer single quotes in `zsh`/`bash` so history expansion does not break copy-paste. Example: `apfel 'Hello, Mac!'`
+Quote prompts with `!` in single quotes (zsh/bash history expansion): `apfel 'Hello, Mac!'`.
 
 ```bash
 # Single prompt
 apfel "What is the capital of Austria?"
 
-# Permissive mode -- reduces guardrail false positives for creative/long prompts
+# Permissive mode - reduces guardrail false positives for creative/long prompts
 apfel --permissive "Write a dramatic opening for a thriller novel"
 
 # Stream output
@@ -75,11 +71,31 @@ apfel -f README.md "Summarize this project"
 # Attach multiple files
 apfel -f old.swift -f new.swift "What changed between these two files?"
 
+# Attach a PDF or image - on-device text extraction, OCR, and "what the image is about"
+apfel -f report.pdf "Summarize the key findings"
+apfel -f receipt.jpg "What is the total?"
+
+# Pipe a file straight in (PDF, image, or text)
+cat report.pdf | apfel "Summarize this"
+
 # Combine files with piped input
 git diff HEAD~1 | apfel -f CONVENTIONS.md "Review this diff against our conventions"
 
+# Only the code - no prose, no markdown fences (pipe-safe, exit 7 if empty)
+apfel --code "a python function that deduplicates a list" > dedupe.py
+apfel --code "shell one-liner to find the 10 largest files here" | pbcopy
+
 # JSON output for scripting
 apfel -o json "Translate to German: hello" | jq .content
+
+# Guaranteed schema-valid JSON output (guided generation)
+apfel --schema person.schema.json "Extract the person: Alice is 30." | jq .name
+
+# One-shot multi-turn: conversation JSON in, next assistant turn out
+jq '. += [{"role":"user","content":"and in German?"}]' conv.json | apfel --messages -
+
+# Preflight token budget before a large prompt
+apfel --count-tokens -f README.md "Summarize this"
 
 # System prompt
 apfel -s "You are a pirate" "What is recursion?"
@@ -96,9 +112,9 @@ result=$(apfel -q "Capital of France? One word.")
 ```bash
 apfel --serve                              # foreground
 brew services start apfel                  # background (like Ollama)
+brew services stop apfel
+APFEL_TOKEN=$(uuidgen) APFEL_MCP=/path/to/tools.py brew services start apfel
 ```
-
-Then in another terminal:
 
 ```bash
 curl http://localhost:11434/v1/chat/completions \
@@ -106,11 +122,8 @@ curl http://localhost:11434/v1/chat/completions \
   -d '{"model":"apple-foundationmodel","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-Works with the official Python client:
-
 ```python
 from openai import OpenAI
-
 client = OpenAI(base_url="http://localhost:11434/v1", api_key="unused")
 resp = client.chat.completions.create(
     model="apple-foundationmodel",
@@ -119,15 +132,11 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-Run in background (auto-restarts, starts at login - [docs/background-service.md](docs/background-service.md)):
+Background service details: [docs/background-service.md](docs/background-service.md).
 
-```bash
-brew services start apfel
-brew services stop apfel
-APFEL_TOKEN=$(uuidgen) APFEL_MCP=/path/to/tools.py brew services start apfel
-```
+### Quick testing chat
 
-### Interactive chat
+`apfel --chat` is a small REPL for testing prompts or MCP servers. For a GUI chat app, see [apfel-chat](https://github.com/Arthur-Ficial/apfel-chat).
 
 ```bash
 apfel --chat
@@ -136,105 +145,75 @@ apfel --chat --mcp ./mcp/calculator/server.py      # chat with MCP tools
 apfel --chat --debug                                # debug output to stderr
 ```
 
-Ctrl-C exits cleanly. Context window is managed automatically with configurable strategies ([docs/context-strategies.md](docs/context-strategies.md)).
+Ctrl-C exits. Context is trimmed automatically ([docs/context-strategies.md](docs/context-strategies.md)).
 
 ## Demos
 
-See [`demo/`](./demo/) for real-world shell scripts powered by apfel.
-
-**[cmd](./demo/cmd)** — natural language to shell command:
+Real shell scripts that wrap `apfel`: `cmd` (English to shell command), `oneliner`, `mac-narrator`, `wtd`, `explain`, `naming`, `port`, `gitsum`. They are bundled in the binary - no repo clone. Write them out wherever you installed apfel from (homebrew-core, the tap, or source):
 
 ```bash
-demo/cmd "find all .log files modified today"
+apfel demos ./apfel-demos
+```
+
+That writes every demo (executable) plus a `README.md` into `./apfel-demos`. Then run them from there:
+
+```bash
+./apfel-demos/cmd "find all .log files modified today"
 # $ find . -name "*.log" -type f -mtime -1
 
-demo/cmd -x "show disk usage sorted by size"   # -x = execute after confirm
-demo/cmd -c "list open ports"                   # -c = copy to clipboard
+./apfel-demos/cmd -x "show disk usage sorted by size"   # -x = execute after confirm
+./apfel-demos/cmd -c "list open ports"                   # -c = copy to clipboard
 ```
 
-**Shell function version** — add to your `.zshrc` and use `cmd` from anywhere:
-
-```bash
-# cmd - natural language to shell command (apfel). Add to .zshrc:
-cmd(){ local x c r a; while [[ $1 == -* ]]; do case $1 in -x)x=1;shift;; -c)c=1;shift;; *)break;; esac; done; r=$(apfel -q -s 'Output only a shell command.' "$*" | sed '/^```/d;/^#/d;s/\x1b\[[0-9;]*[a-zA-Z]//g;s/^[[:space:]]*//;/^$/d' | head -1); [[ $r ]] || { echo "no command generated"; return 1; }; printf '\e[32m$\e[0m %s\n' "$r"; [[ $c ]] && printf %s "$r" | pbcopy && echo "(copied)"; [[ $x ]] && { printf 'Run? [y/N] '; read -r a; [[ $a == y ]] && eval "$r"; }; return 0; }
-```
-
-```bash
-cmd find all swift files larger than 1MB     # shows: $ find . -name "*.swift" -size +1M
-cmd -c show disk usage sorted by size        # shows command + copies to clipboard
-cmd -x what process is using port 3000       # shows command + asks to run it
-cmd list all git branches merged into main
-cmd count lines of code by language
-```
-
-**[oneliner](./demo/oneliner)** — complex pipe chains from plain English:
-
-```bash
-demo/oneliner "sum the third column of a CSV"
-# $ awk -F',' '{sum += $3} END {print sum}' file.csv
-
-demo/oneliner "count unique IPs in access.log"
-# $ awk '{print $1}' access.log | sort | uniq -c | sort -rn
-```
-
-**[mac-narrator](./demo/mac-narrator)** — your Mac's inner monologue:
-
-```bash
-demo/mac-narrator              # one-shot: what's happening right now?
-demo/mac-narrator --watch      # continuous narration every 60s
-```
-
-Also in `demo/`:
-
-- **[wtd](./demo/wtd)** — "what's this directory?" instant project orientation
-- **[explain](./demo/explain)** — explain a command, error, or code snippet
-- **[naming](./demo/naming)** — naming suggestions for functions, variables, files
-- **[port](./demo/port)** — what's using this port?
-- **[gitsum](./demo/gitsum)** — summarize recent git activity
-
-Longer walkthroughs: [docs/demos.md](docs/demos.md).
+Re-run `apfel demos` after `brew upgrade apfel` to refresh. Sources: [`demo/`](./demo/). Walkthroughs and a copy-paste `cmd` shell function for your `.zshrc`: [docs/demos.md](docs/demos.md).
 
 ## MCP Tool Support
 
-Attach [Model Context Protocol](https://modelcontextprotocol.io/) tool servers with `--mcp`. apfel discovers tools, executes them automatically, and returns the final answer. No glue code needed.
+Attach [Model Context Protocol](https://modelcontextprotocol.io/) servers with `--mcp`. apfel discovers, invokes, and returns.
 
 ```bash
 apfel --mcp ./mcp/calculator/server.py "What is 15 times 27?"
 ```
 
 ```
-mcp: ./mcp/calculator/server.py - add, subtract, multiply, divide, sqrt, power    ← stderr
+mcp: ./mcp/calculator/server.py - add, subtract, multiply, divide, sqrt, power, round_number    ← stderr
 tool: multiply({"a": 15, "b": 27}) = 405                                          ← stderr
 15 times 27 is 405.                                                                ← stdout
 ```
 
-Tool info goes to stderr; only the answer goes to stdout. Use `-q` to suppress tool info.
+Use `-q` to suppress tool info.
 
 ```bash
-apfel --mcp ./server_a.py --mcp ./server_b.py "Use both tools"  # multiple servers
-apfel --serve --mcp ./mcp/calculator/server.py                   # server mode
-apfel --chat --mcp ./mcp/calculator/server.py                    # chat mode
+apfel --mcp ./server_a.py --mcp ./server_b.py "Use both tools"
+apfel --serve --mcp ./mcp/calculator/server.py
+apfel --chat --mcp ./mcp/calculator/server.py
 ```
 
-Ships with a calculator MCP server at [`mcp/calculator/`](./mcp/calculator/). See [docs/mcp-calculator.md](docs/mcp-calculator.md) for details.
+Ships with a calculator at [`mcp/calculator/`](./mcp/calculator/) ([docs/mcp-calculator.md](docs/mcp-calculator.md)).
 
-**Remote MCP servers** (Streamable HTTP transport, MCP spec 2025-03-26):
+**Remote MCP servers** (Streamable HTTP, MCP spec 2025-03-26):
 
 ```bash
-# Remote MCP server over HTTPS
 apfel --mcp https://mcp.example.com/v1 "what tools do you have?"
 
-# With bearer token auth - prefer the env var (flag is visible in ps aux)
+# bearer token - prefer env var (flag is visible in ps aux)
 APFEL_MCP_TOKEN=mytoken apfel --mcp https://mcp.example.com/v1 "..."
-apfel --mcp https://mcp.example.com/v1 --mcp-token mytoken "..."
 
-# Mixed local + remote
+# mixed local + remote
 apfel --mcp /path/to/local.py --mcp https://remote.example.com/v1 "..."
 ```
 
-> **Security:** Use `APFEL_MCP_TOKEN` env var rather than `--mcp-token` — CLI flags are visible in `ps aux`. apfel refuses to send a bearer token over plaintext `http://` (use `https://`).
+> **Security:** prefer `APFEL_MCP_TOKEN` over `--mcp-token` (ps aux). apfel refuses bearer tokens over plaintext `http://`.
 
-**Ready-made MCPs.** [apfel-mcp.franzai.com](https://apfel-mcp.franzai.com/) ships three token-budget-optimized MCP servers designed for apfel's 4096-token window: `url-fetch` (Readability article extraction with SSRF guards), `ddg-search` (DuckDuckGo web search, no API key), and the flagship compound `search-and-fetch` tool. Install with `brew install Arthur-Ficial/tap/apfel-mcp`. The repo is open for contributions of new apfel-optimized MCPs — rules at [apfel-mcp.franzai.com/#contribute](https://apfel-mcp.franzai.com/#contribute).
+## apfel-run: optional config layer
+
+apfel itself has no config file - flags + env vars, like any UNIX tool. If you want a TOML config (many MCPs, profiles, team configs in git), [**apfel-run**](https://github.com/Arthur-Ficial/apfel-run) is an MIT wrapper that adds one via `execve` drop-in.
+
+```bash
+brew install Arthur-Ficial/tap/apfel-run
+apfel-run config init                 # starter ~/.config/apfel/config.toml
+alias apfel=apfel-run                 # optional, every apfel flag still works
+```
 
 ## OpenAI API Compatibility
 
@@ -243,13 +222,15 @@ apfel --mcp /path/to/local.py --mcp https://remote.example.com/v1 "..."
 | Feature | Status | Notes |
 |---------|--------|-------|
 | `POST /v1/chat/completions` | Supported | Streaming + non-streaming |
+| `POST /v1/responses` | Supported | OpenAI Responses API: string/message input, `instructions`, streaming (canonical event sequence), `text.format` (incl. `json_schema`), function tools (non-streaming). Stateful features (`previous_response_id`, `store: true`, `background`, `reasoning`, hosted tools) return honest 501s |
 | `GET /v1/models` | Supported | Returns `apple-foundationmodel` |
 | `GET /health` | Supported | Model availability, context window, languages |
 | `GET /v1/logs`, `/v1/logs/stats` | Debug only | Requires `--debug` |
 | Tool calling | Supported | Native `ToolDefinition` + JSON detection. See [docs/tool-calling-guide.md](docs/tool-calling-guide.md) |
-| `response_format: json_object` | Supported | Via system prompt injection |
-| `temperature`, `max_tokens`, `seed` | Supported | Mapped to `GenerationOptions` |
-| `stream: true` | Supported | SSE with usage stats in final chunk |
+| `response_format: json_object` | Supported | System-prompt injection; markdown fences stripped from output |
+| `response_format: json_schema` | Supported | Guaranteed schema-conforming output via FoundationModels `DynamicGenerationSchema`; works with `stream: true` |
+| `temperature`, `top_p`, `max_tokens`, `seed` | Supported | Mapped to `GenerationOptions`. `top_p` is nucleus sampling; `temperature: 0` maps to greedy (deterministic). Omitting `max_tokens` uses the remaining context window (drop-in OpenAI semantics) - see [Default response cap](#default-response-cap-max_tokens) |
+| `stream: true` | Supported | SSE; final usage chunk only when `stream_options: {"include_usage": true}` (per OpenAI spec) |
 | `finish_reason` | Supported | `stop`, `tool_calls`, `length` |
 | Context strategies | Supported | `x_context_strategy`, `x_context_max_turns`, `x_context_output_reserve` extension fields |
 | CORS | Supported | Enable with `--cors` |
@@ -261,31 +242,104 @@ apfel --mcp /path/to/local.py --mcp https://remote.example.com/v1 "..."
 
 Full API spec: [openai/openai-openapi](https://github.com/openai/openai-openapi).
 
+## Default response cap (`max_tokens`)
+
+When `max_tokens` is omitted, **CLI and OpenAI-compatible server behave identically**: the value flows through as `nil` and the model uses whatever room is left in the context window. This is drop-in OpenAI semantics - no arbitrary fallback constant.
+
+The on-device context window holds input *and* output combined: **4096 tokens on macOS 26, 8192 on macOS 27**. apfel reads the real size at runtime via `SystemLanguageModel.contextSize` - check yours with `apfel --model-info`. If generation runs into the ceiling, the response ends cleanly with `finish_reason: "length"` and the partial content is returned (server: HTTP 200; CLI: exit 0 with a stderr warning). Pass `max_tokens` explicitly when you want a tighter latency budget or a known cap for your client.
+
+### Examples
+
+```bash
+# Omitted: uses remaining window, finish_reason: "stop" or "length"
+curl -sS http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"apple-foundationmodel",
+       "messages":[{"role":"user","content":"Reply SKIP, MOVE, or RENAME."}]}'
+
+# Explicit cap (recommended for tight latency budgets)
+curl -sS http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"apple-foundationmodel","max_tokens":128,
+       "messages":[{"role":"user","content":"Summarise: ..."}]}'
+```
+
+### Picking a value
+
+| Use case                               | `max_tokens`  |
+|----------------------------------------|---------------|
+| Single-word / classification reply     | 16 - 32       |
+| One-line instruction                   | 64 - 128      |
+| Short paragraph                        | 256 - 512     |
+| Long paragraph / structured JSON       | 1024 - 2048   |
+| As long as the context window allows   | omit it       |
+
+Keep `input_tokens + max_tokens` comfortably below the context window (4096 tokens on macOS 26, 8192 on macOS 27). If the prompt itself exceeds the window, generation cannot start and the request fails with `[context overflow]` (HTTP 400 / CLI exit 4). The validator rejects non-positive values (`max_tokens <= 0`).
+
+### CLI parity
+
+CLI and server share one rule: omitted = use remaining window. No constant to drift. Override with `--max-tokens N` or `APFEL_MAX_TOKENS=N`.
+
+```bash
+apfel "Reply SKIP."                    # uses remaining window
+apfel --max-tokens 64 "Reply SKIP."    # explicit cap
+APFEL_MAX_TOKENS=2048 apfel "..."      # via env var
+```
+
+### Permissive guardrails for the server
+
+`apfel --serve --permissive` makes the server use Apple's `.permissiveContentTransformations` guardrails for **every request** the process handles. Same flag, same semantics as the CLI's `--permissive` ([docs/PERMISSIVE.md](docs/PERMISSIVE.md)). There is no per-request override - the server operator decides for the whole process.
+
+```bash
+apfel --serve --permissive             # every request uses permissive guardrails
+```
+
 ## Limitations
 
 | Constraint | Detail |
 |------------|--------|
-| Context window | **4096 tokens** (input + output combined) |
+| Context window | **4096 tokens on macOS 26, 8192 on macOS 27** (input + output combined). Not a hardcoded constant - apfel reads `SystemLanguageModel.contextSize` at runtime; `apfel --model-info` prints the live value |
 | Platform | macOS 26+, Apple Silicon only |
-| Model | One model (`apple-foundationmodel`), not configurable |
+| Model | One model (`apple-foundationmodel`, ~3B params on-device), not configurable |
 | Guardrails | Apple's safety system may block benign prompts. `--permissive` reduces false positives ([docs/PERMISSIVE.md](docs/PERMISSIVE.md)) |
-| Speed | On-device, not cloud-scale — a few seconds per response |
+| Speed | On-device, not cloud-scale - a few seconds per response |
 | No embeddings / vision | Not available on-device |
+| Training data / knowledge cutoff | Apple has not published a precise cutoff for the on-device model. When pushed to name one, the model **confabulates a different date each sample** (e.g. "October 2023", "April 2023"). Treat all model self-reports about its own training as unreliable. |
+| No current date or real-time awareness | The model does not know today's date and has no network/clock access. If asked, it will either refuse or invent a date. Inject the current date via system prompt when arithmetic depends on it (see workaround below). |
+
+**Workaround for date-dependent prompts** - inject the current date as a system message:
+
+```bash
+apfel -s "Today is $(date '+%B %d, %Y')." "Write a one-line release note dated today."
+```
+
+```bash
+apfel --chat -s "Today is $(date '+%B %d, %Y'). You are a helpful assistant."
+```
+
+Note: even with an injected date the 3B model can still hallucinate (especially when asked directly about its own training cutoff). The injection helps generative prompts that *use* the date; it does not override the model's self-report reflex.
+
+Background: [#158](https://github.com/Arthur-Ficial/apfel/issues/158).
 
 ## Reference Docs
 
-- [docs/install.md](docs/install.md) — install, troubleshooting, and Apple Intelligence setup
-- [docs/cli-reference.md](docs/cli-reference.md) — every flag, exit code, and environment variable
-- [docs/background-service.md](docs/background-service.md) — `brew services` and launchd usage
-- [docs/openai-api-compatibility.md](docs/openai-api-compatibility.md) — `/v1/*` support matrix in depth
-- [docs/server-security.md](docs/server-security.md) — origin checks, CORS, tokens, and `--footgun`
-- [docs/context-strategies.md](docs/context-strategies.md) — chat trimming strategies
-- [docs/mcp-calculator.md](docs/mcp-calculator.md) — local and remote MCP usage
-- [docs/tool-calling-guide.md](docs/tool-calling-guide.md) — detailed tool-calling behavior
-- [docs/integrations.md](docs/integrations.md) — third-party tool integrations (opencode, etc.)
-- [docs/local-setup-with-vs-code.md](docs/local-setup-with-vs-code.md) — local review with apfel + a second edit/apply model in VS Code
-- [docs/demos.md](docs/demos.md) — longer walkthroughs of the shell demos
-- [docs/EXAMPLES.md](docs/EXAMPLES.md) — 50+ real prompts with unedited output
+Guides to use apfel from [Python](docs/guides/python.md), [Node.js](docs/guides/nodejs.md), [Ruby](docs/guides/ruby.md), [PHP](docs/guides/php.md), [Bash/curl](docs/guides/bash-curl.md), [Zsh](docs/guides/zsh.md), [AppleScript](docs/guides/applescript.md), [Swift](docs/guides/swift-scripting.md), [Perl](docs/guides/perl.md), [AWK](docs/guides/awk.md) - see [docs/guides/index.md](docs/guides/index.md). Empirically tested; runnable proof at [apfel-guides-lab](https://github.com/Arthur-Ficial/apfel-guides-lab).
+
+- [docs/install.md](docs/install.md) - install, troubleshooting, and Apple Intelligence setup
+- [docs/cli-reference.md](docs/cli-reference.md) - every flag, exit code, and environment variable
+- [docs/file-extraction.md](docs/file-extraction.md) - `-f` and piped PDF / image / text extraction (OCR + image understanding)
+- [docs/background-service.md](docs/background-service.md) - `brew services` and launchd usage
+- [docs/openai-api-compatibility.md](docs/openai-api-compatibility.md) - `/v1/*` support matrix in depth
+- [docs/server-security.md](docs/server-security.md) - origin checks, CORS, tokens, and `--footgun`
+- [docs/context-strategies.md](docs/context-strategies.md) - chat trimming strategies
+- [docs/mcp-calculator.md](docs/mcp-calculator.md) - local and remote MCP usage
+- [docs/tool-calling-guide.md](docs/tool-calling-guide.md) - detailed tool-calling behavior
+- [docs/integrations.md](docs/integrations.md) - third-party tool integrations (opencode, etc.)
+- [docs/local-setup-with-vs-code.md](docs/local-setup-with-vs-code.md) - local review with apfel + a second edit/apply model in VS Code
+- [docs/demos.md](docs/demos.md) - longer walkthroughs of the shell demos
+- [docs/EXAMPLES.md](docs/EXAMPLES.md) - 50+ real prompts with unedited output
+- [docs/swift-library.md](docs/swift-library.md) - `ApfelCore` Swift Package for downstream developers
+- [docs/coreai-impact.md](docs/coreai-impact.md) - why apfel runs on FoundationModels, not Apple's new Core AI (the Core ML successor)
 
 ## Architecture
 
@@ -298,80 +352,61 @@ HTTP Server (/v1/*) ───────┘   (100% on-device, zero network)
                                 TokenCounter → real token counts (SDK 26.4)
 ```
 
-Swift 6.3 strict concurrency. Three targets: `ApfelCore` (pure logic, unit-testable), `apfel` (CLI + server), and `apfel-tests` (pure Swift runner, no XCTest).
+Swift 6.3 strict concurrency. Three targets: `ApfelCore` (pure logic, unit-testable, also available as a Swift Package product - linked under Reference Docs above), `apfel` (CLI + server), and `apfel-tests` (pure Swift runner, no XCTest).
 
 ## Build & Test
 
 ```bash
+make test                                # release build + all unit/integration tests
+make preflight                           # full release qualification
 make install                             # build release + install to /usr/local/bin
 make build                               # build release only
 make version                             # print current version
-make release-minor                       # bump minor: 0.6.x -> 0.7.0
+make release                             # patch release
+make release TYPE=minor                  # minor release
+make release TYPE=major                  # major release
 swift build                              # quick debug build (no version bump)
 swift run apfel-tests                    # unit tests
 python3 -m pytest Tests/integration/ -v  # integration tests
 apfel --benchmark -o json                # performance report
 ```
 
-Every `make build`/`make install` auto-bumps the patch version, updates the README badge, and generates build metadata. `.version` is the single source of truth.
+`.version` is the single source of truth. Only `make release` bumps versions. Local builds do not change the version.
 
 ## The apfel tree
 
-Everything that grows out of apfel. Each project ships as its own repo, its own landing page, and its own Homebrew formula or cask.
+Projects built on apfel. Each ships as its own repo + Homebrew formula.
 
-### Trunk
-
-- **apfel** — on-device Apple FoundationModels CLI and OpenAI-compatible server. The root of the tree; every other project uses it for inference.
-  - Site: [https://apfel.franzai.com](https://apfel.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfel](https://github.com/Arthur-Ficial/apfel)
-  - Install: `brew install Arthur-Ficial/tap/apfel`
-
-### Apps
-
-- **apfel-chat** — multi-conversation macOS chat client. Streaming markdown, speech I/O, image analysis via Apple Vision. Runs 100% on-device.
-  - Site: [https://apfel-chat.franzai.com](https://apfel-chat.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfel-chat](https://github.com/Arthur-Ficial/apfel-chat)
-  - Install: `brew install Arthur-Ficial/tap/apfel-chat`
-
-- **apfel-clip** — AI clipboard actions from the macOS menu bar. Summarize, translate, rewrite, and reshape whatever you just copied, without leaving the keyboard.
-  - Site: [https://apfel-clip.franzai.com](https://apfel-clip.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfel-clip](https://github.com/Arthur-Ficial/apfel-clip)
-  - Install: `brew install Arthur-Ficial/tap/apfel-clip`
-
-- **apfel-quick** — instant AI overlay for macOS. Press a key, ask anything, get an on-device answer — then dismiss.
-  - Site: [https://apfel-quick.franzai.com](https://apfel-quick.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfel-quick](https://github.com/Arthur-Ficial/apfel-quick)
-  - Install: `brew install Arthur-Ficial/tap/apfel-quick`
-
-- **apfelpad** — a formula notepad for thinking. On-device AI as a first-class function you can call inline from cells, the way a spreadsheet treats `SUM`.
-  - Site: [https://apfelpad.franzai.com](https://apfelpad.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfelpad](https://github.com/Arthur-Ficial/apfelpad)
-  - Install: `brew install Arthur-Ficial/tap/apfelpad`
-
-### Extensions
-
-- **apfel-mcp** — three token-budget-optimized MCP servers for apfel's 4096-token context window: `url-fetch` (Readability article extraction with SSRF guards), `ddg-search` (DuckDuckGo web search, no API key), and the flagship compound `search-and-fetch` tool. Open for contributions of more apfel-optimized MCPs.
-  - Site: [https://apfel-mcp.franzai.com](https://apfel-mcp.franzai.com)
-  - Repo: [https://github.com/Arthur-Ficial/apfel-mcp](https://github.com/Arthur-Ficial/apfel-mcp)
-  - Install: `brew install Arthur-Ficial/tap/apfel-mcp`
-
-- **apfel-gui** — native SwiftUI debug inspector for apfel with request timeline, MCP protocol viewer, chat, and TTS/STT. Built for developers who want to watch exactly what apfel sends to the model.
-  - Repo: [https://github.com/Arthur-Ficial/apfel-gui](https://github.com/Arthur-Ficial/apfel-gui)
-  - Install: `brew install Arthur-Ficial/tap/apfel-gui`
+| Project | What it does | Install |
+|---------|--------------|---------|
+| [**apfel**](https://apfel.franzai.com) | The root. On-device FoundationModels CLI + OpenAI-compatible server. | `brew install apfel` |
+| [**apfel-chat**](https://apfel-chat.franzai.com) | macOS chat client: streaming markdown, speech I/O, Apple Vision image analysis. | `brew install Arthur-Ficial/tap/apfel-chat` |
+| [**apfel-clip**](https://apfel-clip.franzai.com) | Menu-bar AI actions on the clipboard: summarize, translate, rewrite. | `brew install Arthur-Ficial/tap/apfel-clip` |
+| [**apfel-quick**](https://apfel-quick.franzai.com) | Instant AI overlay: press a key, ask, answer, dismiss. | `brew install Arthur-Ficial/tap/apfel-quick` |
+| [**apfelpad**](https://apfelpad.franzai.com) | Formula notepad - on-device AI as an inline cell function. | `brew install Arthur-Ficial/tap/apfelpad` |
+| [**apfel-mcp**](https://apfel-mcp.franzai.com) | Token-budget-optimized MCPs for the small on-device window: `url-fetch`, `ddg-search`, `search-and-fetch`. | `brew install Arthur-Ficial/tap/apfel-mcp` |
+| [**apfel-gui**](https://github.com/Arthur-Ficial/apfel-gui) | SwiftUI debug inspector: request timeline, MCP protocol viewer, TTS/STT. | `brew install Arthur-Ficial/tap/apfel-gui` |
+| [**apfel-run**](https://github.com/Arthur-Ficial/apfel-run) | UNIX wrapper adding a persistent MCP registry + TOML config on top of `apfel`. | `brew install Arthur-Ficial/tap/apfel-run` |
+| [**apfel-tag**](https://github.com/Arthur-Ficial/apfel-tag) | On-device content tagging CLI: pipe text in, get tags/topics/emotions out. | `brew install Arthur-Ficial/tap/apfel-tag` |
+| [**apfel-server-kit**](https://github.com/Arthur-Ficial/apfel-server-kit) | Swift package for ecosystem tools: discover, spawn, and stream from a local `apfel --serve`. | Swift Package |
 
 ## Community Projects
 
 Built something on top of apfel? Open an issue and it can be added here.
 
-- [https://apfelclaw.yamanlabs.com/](https://apfelclaw.yamanlabs.com/), [https://github.com/julianyaman/apfelclaw](https://github.com/julianyaman/apfelclaw), by [https://github.com/julianYaman](https://github.com/julianYaman) — local AI agent that reads files, calendar, mail, and Mac status via read-only tools
+| Project | What it does | Links |
+|---------|-------------|-------|
+| **apfelclaw** by [@julianYaman](https://github.com/julianYaman) | Local AI agent that reads files, calendar, mail, and Mac status via read-only tools | [github](https://github.com/julianyaman/apfelclaw) - [site](https://apfelclaw.yamanlabs.com/) |
+| **fruit-chat** by [@bhaskarvilles](https://github.com/bhaskarvilles) | Browser-based chat UI that talks to `apfel --serve` over the OpenAI-compatible API | [github](https://github.com/bhaskarvilles/fruit-chat) |
+| **local-claude** by [@lucaspwo](https://github.com/lucaspwo) | Claude Code wrapper that swaps in apfel as a local backend via a small Anthropic-OpenAI proxy | [github](https://github.com/lucaspwo/local-claude) |
+| **apfeller** by [@hasit](https://github.com/hasit) | App manager for local shell apps built around apfel | [github](https://github.com/hasit/apfeller) - [site](https://hasit.github.io/apfeller/) - [catalog](https://hasit.github.io/apfeller/catalog/) |
+| **apfel-for-raycast** by [@eggsy](https://github.com/eggsy) | Raycast command bar extension: ask, translate, explain files and directories, conversation history, custom system prompts. On-device via apfel CLI. | [store](https://www.raycast.com/eggsy/apfel) - [github](https://github.com/raycast/extensions/tree/main/extensions/apfel) |
 
 ## Contributing
 
-Bug reports, feature ideas, pull requests, and new community projects all welcome. Open an issue or a PR on the relevant repo.
+Issues and PRs welcome on any `Arthur-Ficial/apfel*` repo.
 
-**#agentswelcome** — AI agent contributions are welcome across the entire apfel tree — apfel itself and every `Arthur-Ficial/apfel-*` repo. Claude Code, Codex, Cursor, Aider, any autonomous coding agent: if you can read the repo's `CLAUDE.md`, run the tests, and open a pull request, you can contribute. Credit your tool in the commit trailer (e.g. `Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>`), include a passing test suite, and submit. Humans and agents are reviewed on the same bar: clean code, passing tests, honesty about limits.
-
-The most agent-friendly entry point is [apfel-mcp](https://github.com/Arthur-Ficial/apfel-mcp) — its contribution rules and idea list at [apfel-mcp.franzai.com/#contribute](https://apfel-mcp.franzai.com/#contribute) are written to be unambiguous enough for an agent to follow without human translation.
+**#agentswelcome** - AI agent PRs are fine. Read the repo's `CLAUDE.md`, run the tests, credit the tool in a `Co-Authored-By` trailer. Same bar as humans: clean code, passing tests, honest limits. Most agent-friendly entry point: [apfel-mcp](https://github.com/Arthur-Ficial/apfel-mcp) ([contribution rules](https://apfel-mcp.franzai.com/#contribute)).
 
 ## License
 

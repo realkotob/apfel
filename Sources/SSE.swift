@@ -4,6 +4,19 @@
 // ============================================================================
 
 import Foundation
+import Hummingbird
+import ApfelCore
+
+/// Build the HTTP response headers every SSE streaming endpoint sends,
+/// from the shared `EventStreamResponseHeaders` policy in ApfelCore
+/// (single source of truth for names, values, and order).
+func eventStreamHeaders() -> HTTPFields {
+    var headers = HTTPFields()
+    for field in EventStreamResponseHeaders.fields {
+        headers[.init(field.name)!] = field.value
+    }
+    return headers
+}
 
 /// Format a single SSE data line from a ChatCompletionChunk.
 /// Returns: "data: {json}\n\n"
@@ -16,7 +29,10 @@ func sseDataLine(_ chunk: ChatCompletionChunk) -> String {
 let sseDone = "data: [DONE]\n\n"
 
 /// Create the initial SSE chunk that announces the assistant role.
-func sseRoleChunk(id: String, created: Int) -> ChatCompletionChunk {
+///
+/// `includeUsage` emits explicit `usage: null` on this non-final chunk when the
+/// client opted into `stream_options.include_usage` (#238).
+func sseRoleChunk(id: String, created: Int, includeUsage: Bool = false) -> ChatCompletionChunk {
     ChatCompletionChunk(
         id: id,
         object: "chat.completion.chunk",
@@ -28,12 +44,13 @@ func sseRoleChunk(id: String, created: Int) -> ChatCompletionChunk {
             finish_reason: nil,
             logprobs: nil
         )],
-        usage: nil
+        usage: nil,
+        includeUsageNull: includeUsage
     )
 }
 
 /// Create a content delta SSE chunk.
-func sseContentChunk(id: String, created: Int, content: String) -> ChatCompletionChunk {
+func sseContentChunk(id: String, created: Int, content: String, includeUsage: Bool = false) -> ChatCompletionChunk {
     ChatCompletionChunk(
         id: id,
         object: "chat.completion.chunk",
@@ -45,7 +62,44 @@ func sseContentChunk(id: String, created: Int, content: String) -> ChatCompletio
             finish_reason: nil,
             logprobs: nil
         )],
-        usage: nil
+        usage: nil,
+        includeUsageNull: includeUsage
+    )
+}
+
+/// Create a refusal delta SSE chunk (streams the model's refusal text).
+func sseRefusalChunk(id: String, created: Int, refusal: String, includeUsage: Bool = false) -> ChatCompletionChunk {
+    ChatCompletionChunk(
+        id: id,
+        object: "chat.completion.chunk",
+        created: created,
+        model: modelName,
+        choices: [.init(
+            index: 0,
+            delta: .init(refusal: refusal),
+            finish_reason: nil,
+            logprobs: nil
+        )],
+        usage: nil,
+        includeUsageNull: includeUsage
+    )
+}
+
+/// Create the final SSE chunk that carries `finish_reason: "content_filter"`.
+func sseContentFilterFinishChunk(id: String, created: Int, includeUsage: Bool = false) -> ChatCompletionChunk {
+    ChatCompletionChunk(
+        id: id,
+        object: "chat.completion.chunk",
+        created: created,
+        model: modelName,
+        choices: [.init(
+            index: 0,
+            delta: .init(),
+            finish_reason: FinishReason.contentFilter.openAIValue,
+            logprobs: nil
+        )],
+        usage: nil,
+        includeUsageNull: includeUsage
     )
 }
 

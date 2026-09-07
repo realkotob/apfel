@@ -22,9 +22,17 @@ struct ServerConfig: Sendable {
     let publicHealth: Bool
     let retryEnabled: Bool
     let retryCount: Int
+    let permissive: Bool
 
     var healthRequiresAuthentication: Bool {
         token != nil && !publicHealth && !isLoopbackHost(host)
+    }
+
+    var originValidationConstrains: Bool {
+        ServerSecurity.originValidationConstrains(
+            originCheckEnabled: originCheckEnabled,
+            allowedOrigins: allowedOrigins
+        )
     }
 }
 
@@ -49,26 +57,46 @@ nonisolated(unsafe) var serverState: ServerState!
 /// Start the OpenAI-compatible HTTP server.
 func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async throws {
     serverState = ServerState(config: config, mcpManager: mcpManager)
+
+    // Pre-fetch supportedLanguages BEFORE binding so any SDK-level crash
+    // fails visibly during startup instead of SIGSEGV on a routine health
+    // probe (apfel-gui#4). supportedLanguages stays cached (crash safety).
+    //
+    // contextSize is read per-request (like isAvailable) because on
+    // macOS 27 the SDK returns 0 during initialization (~80s cold start)
+    // and caching that locks in a wrong value for the process lifetime.
+    // TokenCounter.contextSize applies a high-water mark + 4096 floor,
+    // so per-request reads are both safe and cheap (#192).
+    let tc = TokenCounter.shared
+    let cachedLangs = await tc.supportedLanguages
+
+    // Prewarm the model so the first chat completion does not pay the
+    // cold-start cost. No-op (and false) when the model is unavailable, so an
+    // unavailable model never crashes startup. The outcome is reported on
+    // /health as "prewarmed" (#169).
+    let prewarmed = await tc.prewarm()
+
     let router = Router()
 
     // Security middleware: origin check, token auth, CORS headers
     router.add(middleware: SecurityMiddleware<BasicRequestContext>(config: config))
 
-    // Health - includes model availability from SDK
+    // Health - includes model availability from SDK.
+    // supportedLanguages cached from startup (crash safety, apfel-gui#4).
+    // contextSize read per-request via TokenCounter (high-water + floor, #192).
     router.get("/health") { _, _ -> Response in
         let active = await serverState.logStore.activeRequests
-        let tc = TokenCounter.shared
-        let available = await tc.isAvailable
-        let contextSize = await tc.contextSize
-        let langs = await tc.supportedLanguages
+        let available = await TokenCounter.shared.isAvailable
+        let contextWindow = await TokenCounter.shared.contextSize
         let health: [String: Any] = [
             "status": available ? "ok" : "model_unavailable",
             "model": modelName,
             "version": version,
             "active_requests": active,
-            "context_window": contextSize,
+            "context_window": contextWindow,
             "model_available": available,
-            "supported_languages": langs
+            "prewarmed": prewarmed,
+            "supported_languages": cachedLangs
         ]
         if let data = try? JSONSerialization.data(withJSONObject: health, options: [.sortedKeys]),
            let json = String(data: data, encoding: .utf8) {
@@ -77,19 +105,19 @@ func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async thro
         return jsonResponse("{\"status\":\"ok\"}")
     }
 
-    // Models — includes context_window and supported_languages from SDK
+    // Models — includes context_window and supported_languages from SDK.
+    // supportedLanguages cached from startup (crash safety, apfel-gui#4).
+    // contextSize read per-request via TokenCounter (high-water + floor, #192).
     router.get("/v1/models") { _, _ -> Response in
-        let tc = TokenCounter.shared
-        let contextSize = await tc.contextSize
-        let langs = await tc.supportedLanguages
+        let contextWindow = await TokenCounter.shared.contextSize
         return jsonResponse(jsonString(ModelsListResponse(
             object: "list",
             data: [.init(
                 id: modelName, object: "model", created: 1719792000, owned_by: "apple",
-                context_window: contextSize,
+                context_window: contextWindow,
                 supported_parameters: ["temperature", "max_tokens", "seed", "stream", "tools", "tool_choice", "response_format", "x_context_strategy", "x_context_max_turns", "x_context_output_reserve"],
                 unsupported_parameters: ["logprobs", "n", "stop", "presence_penalty", "frequency_penalty"],
-                notes: "Apple on-device model via FoundationModels framework. Unsupported parameters are rejected with 400 when present (except n=1 and logprobs=false). Supported languages: \(langs.joined(separator: ", "))"
+                notes: "Apple on-device model via FoundationModels framework. Unsupported parameters are rejected with 400 when present (except n=1 and logprobs=false). Supported languages: \(cachedLangs.joined(separator: ", "))"
             )]
         )))
     }
@@ -125,7 +153,12 @@ func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async thro
             await serverState.logStore.requestFinished()
             throw error
         }
-        if !result.trace.stream {
+        // Release the permit + active_requests for every response that does
+        // not own its cleanup. Only live SSE AsyncStream responses set
+        // ownsCleanup (they release in onTermination); keying this on
+        // trace.stream leaked one permit per early-failing streaming
+        // request until the server was wedged (#213).
+        if !result.trace.ownsCleanup {
             await serverState.semaphore.signal()
             await serverState.logStore.requestFinished()
         }
@@ -136,6 +169,61 @@ func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async thro
             id: requestId,
             timestamp: ISO8601DateFormatter().string(from: start),
             method: "POST", path: "/v1/chat/completions",
+            status: result.response.status == .ok ? 200 : result.response.status.code,
+            duration_ms: durationMs,
+            stream: result.trace.stream,
+            estimated_tokens: result.trace.estimatedTokens,
+            error: result.trace.error,
+            request_body: result.trace.requestBody,
+            response_body: result.trace.responseBody,
+            events: result.trace.events
+        )
+        await serverState.logStore.append(log)
+
+        return result.response
+    }
+
+    // Responses API (#365) - same logging/concurrency wrapper as chat.
+    router.post("/v1/responses") { request, context -> Response in
+        let start = Date()
+        let requestId = "resp-\(UUID().uuidString.prefix(12).lowercased())"
+
+        do {
+            try await serverState.semaphore.wait(timeout: .seconds(30))
+        } catch {
+            let log = RequestLog(
+                id: requestId, timestamp: ISO8601DateFormatter().string(from: Date()),
+                method: "POST", path: "/v1/responses", status: 429,
+                duration_ms: Int(Date().timeIntervalSince(start) * 1000),
+                stream: false, estimated_tokens: nil,
+                error: "Too many concurrent requests", request_body: nil, response_body: nil, events: ["semaphore timeout"]
+            )
+            await serverState.logStore.append(log)
+            return openAIError(status: .tooManyRequests, message: "Server at max concurrent capacity (\(config.maxConcurrent)). Try again later or increase with --max-concurrent.", type: "rate_limit_error")
+        }
+
+        await serverState.logStore.requestStarted()
+
+        let result: (response: Response, trace: ChatRequestTrace)
+        do {
+            result = try await handleResponses(request, context: context)
+        } catch {
+            await serverState.semaphore.signal()
+            await serverState.logStore.requestFinished()
+            throw error
+        }
+        // Same permit rule as chat completions (#213): only live SSE streams
+        // own their cleanup via onTermination.
+        if !result.trace.ownsCleanup {
+            await serverState.semaphore.signal()
+            await serverState.logStore.requestFinished()
+        }
+
+        let durationMs = Int(Date().timeIntervalSince(start) * 1000)
+        let log = RequestLog(
+            id: requestId,
+            timestamp: ISO8601DateFormatter().string(from: start),
+            method: "POST", path: "/v1/responses",
             status: result.response.status == .ok ? 200 : result.response.status.code,
             duration_ms: durationMs,
             stream: result.trace.stream,
@@ -200,37 +288,51 @@ func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async thro
 
     let app = Application(
         router: router,
+        server: .http1(configuration: .init(idleTimeout: .seconds(30))),
         configuration: .init(
             address: .hostname(config.host, port: config.port)
         )
     )
 
-    let originStatus = config.originCheckEnabled
+    let originStatus = config.originValidationConstrains
         ? "localhost only (\(config.allowedOrigins.joined(separator: ", ")))"
-        : styled("disabled (all origins allowed)", .red)
+        : styledErr("disabled (all origins allowed)", .red)
     var bannerLines = [
-        "\(styled("apfel server", .cyan, .bold)) v\(version)",
-        "\(styled("├", .dim)) endpoint: http://\(config.host):\(config.port)",
-        "\(styled("├", .dim)) model:    \(modelName)",
-        "\(styled("├", .dim)) cors:     \(config.cors ? "enabled" : "disabled")",
-        "\(styled("├", .dim)) origin:   \(originStatus)",
-        "\(styled("├", .dim)) token:    \(config.token != nil ? "required" : "none")",
-        "\(styled("├", .dim)) health:   \(config.healthRequiresAuthentication ? "auth required" : "public")",
-        "\(styled("├", .dim)) max concurrent: \(config.maxConcurrent)",
-        "\(styled("├", .dim)) debug:    \(config.debug ? "on" : "off")",
+        "\(styledErr("apfel server", .cyan, .bold)) v\(version)",
+        "\(styledErr("├", .dim)) endpoint: http://\(config.host):\(config.port)",
+        "\(styledErr("├", .dim)) model:    \(modelName)",
+        "\(styledErr("├", .dim)) cors:     \(config.cors ? "enabled" : "disabled")",
+        "\(styledErr("├", .dim)) origin:   \(originStatus)",
+        "\(styledErr("├", .dim)) token:    \(config.token != nil ? "required" : "none")",
+        "\(styledErr("├", .dim)) health:   \(config.healthRequiresAuthentication ? "auth required" : "public")",
+        "\(styledErr("├", .dim)) max concurrent: \(config.maxConcurrent)",
+        "\(styledErr("├", .dim)) debug:    \(config.debug ? "on" : "off")",
     ]
     if config.tokenWasAutoGenerated, let token = config.token {
-        bannerLines.append("\(styled("├", .dim)) \(styled("token:", .yellow)) \(token)")
+        bannerLines.append("\(styledErr("├", .dim)) \(styledErr("token:", .yellow)) \(token)")
     }
-    if !config.originCheckEnabled && config.cors {
-        bannerLines.append("\(styled("├", .dim)) \(styled("WARNING: --footgun mode - no origin check + CORS enabled", .red, .bold))")
-        bannerLines.append("\(styled("├", .dim)) \(styled("Any website can access this server and read responses!", .red))")
+    // The loud warning fires whenever origin validation is off, not only when
+    // CORS is also on (#232). Without origin checks, any web page can read
+    // responses from this server regardless of the CORS flag.
+    if !config.originValidationConstrains {
+        let headline = config.cors
+            ? "WARNING: --footgun mode - no origin check + CORS enabled"
+            : "WARNING: origin check disabled - all origins allowed"
+        bannerLines.append("\(styledErr("├", .dim)) \(styledErr(headline, .red, .bold))")
+        bannerLines.append("\(styledErr("├", .dim)) \(styledErr("Any website can access this server and read responses!", .red))")
     }
-    bannerLines.append("\(styled("└", .dim)) ready")
+    // Non-loopback bind with no token = zero authentication for every host that
+    // can reach the socket. Warn as loudly as the footgun warning; do not refuse
+    // to bind (that would be a breaking behavior change) (#228).
+    if ServerSecurity.shouldWarnExposedWithoutToken(host: config.host, hasToken: config.token != nil) {
+        bannerLines.append("\(styledErr("├", .dim)) \(styledErr("WARNING: bound to \(config.host) with NO token - unauthenticated access from any host that can reach this machine!", .red, .bold))")
+        bannerLines.append("\(styledErr("├", .dim)) \(styledErr("Set a token: --token <secret> or --token-auto. See docs/server-security.md", .red))")
+    }
+    bannerLines.append("\(styledErr("└", .dim)) ready")
     printStderr(bannerLines.joined(separator: "\n"))
 
     printStderr("")
-    printStderr(styled("Endpoints:", .yellow, .bold))
+    printStderr(styledErr("Endpoints:", .yellow, .bold))
     printStderr("  POST http://\(config.host):\(config.port)/v1/chat/completions")
     printStderr("  GET  http://\(config.host):\(config.port)/v1/models")
     if config.debug {
@@ -244,20 +346,16 @@ func startServer(config: ServerConfig, mcpManager: MCPManager? = nil) async thro
         try await app.run()
     } catch let error as IOError where error.errnoCode == EADDRINUSE {
         printStderr("")
-        printStderr(styled("error: Port \(config.port) is already in use.", .red, .bold))
+        printStderr(styledErr("error: Port \(config.port) is already in use.", .red, .bold))
         printStderr("Another process (e.g. Ollama) may be listening on this port.")
-        printStderr("Fix: \(styled("apfel --serve --port <other-port>", .cyan)) or stop the other process.")
+        printStderr("Fix: \(styledErr("apfel --serve --port <other-port>", .cyan)) or stop the other process.")
         exit(exitRuntimeError)
     }
 }
 
 func isLoopbackHost(_ host: String) -> Bool {
-    switch host.lowercased() {
-    case "127.0.0.1", "localhost", "::1", "[::1]":
-        return true
-    default:
-        return false
-    }
+    // Single source of truth lives in ApfelCore so it is unit-testable (#228).
+    ServerSecurity.isLoopbackHost(host)
 }
 
 // MARK: - Query Parameter Parsing

@@ -6,10 +6,16 @@ let package = Package(
     name: "apfel",
     platforms: [.macOS(.v26)],
     products: [
+        .library(name: "ApfelCore", targets: ["ApfelCore"]),
         .executable(name: "apfel", targets: ["apfel"])
     ],
     dependencies: [
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
+        .package(url: "https://github.com/apple/swift-docc-plugin.git", from: "1.4.6"),
+        // lesbar: shared on-device file -> text (Vision OCR + PDFKit) + image
+        // classification. Owns the -f/pipe extraction stack so it is maintained once
+        // (also consumed by auge). Framework-bearing target used only by the executable.
+        .package(url: "https://github.com/Arthur-Ficial/lesbar.git", from: "0.3.0"),
     ],
     targets: [
         .systemLibrary(
@@ -36,6 +42,8 @@ let package = Package(
                 "ApfelCore",
                 "ApfelCLI",
                 "CReadline",
+                .product(name: "Lesbar", package: "lesbar"),
+                .product(name: "LesbarCore", package: "lesbar"),
             ],
             path: "Sources",
             exclude: ["Core", "CLI"],
@@ -53,6 +61,31 @@ let package = Package(
             name: "apfel-tests",
             dependencies: ["ApfelCore", "ApfelCLI"],
             path: "Tests/apfelTests"
+        ),
+        .executableTarget(
+            name: "apfelcore-context-strategies-example",
+            dependencies: ["ApfelCore"],
+            path: "Examples/ContextStrategies"
+        ),
+        .executableTarget(
+            name: "apfelcore-openai-types-example",
+            dependencies: ["ApfelCore"],
+            path: "Examples/OpenAITypes"
+        ),
+        .executableTarget(
+            name: "apfelcore-tool-calling-example",
+            dependencies: ["ApfelCore"],
+            path: "Examples/ToolCalling"
+        ),
+        .executableTarget(
+            name: "apfelcore-error-handling-example",
+            dependencies: ["ApfelCore"],
+            path: "Examples/ErrorHandling"
+        ),
+        .executableTarget(
+            name: "apfelcore-mcp-protocol-example",
+            dependencies: ["ApfelCore"],
+            path: "Examples/MCPProtocol"
         ),
     ]
 )

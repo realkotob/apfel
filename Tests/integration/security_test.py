@@ -111,6 +111,55 @@ def ensure_default_server():
         yield
 
 
+# MARK: - Host header validation (DNS-rebinding defense, #230)
+
+def test_foreign_host_header_rejected():
+    """A foreign Host header (rebinding attacker domain) is rejected (#230)."""
+    resp = httpx.get(
+        f"{BASE_URL}/v1/models",
+        headers={"Host": "attacker.com"},
+        timeout=10,
+    )
+    assert resp.status_code == 403
+    assert "Host" in resp.json()["error"]["message"]
+
+
+def test_foreign_host_header_rejected_on_health():
+    """Rebinding must not reach /health either (#230)."""
+    resp = httpx.get(
+        f"{BASE_URL}/health",
+        headers={"Host": "attacker.com"},
+        timeout=10,
+    )
+    assert resp.status_code == 403
+
+
+def test_localhost_host_header_allowed():
+    """The normal localhost Host header (with port) is accepted (#230)."""
+    resp = httpx.get(
+        f"{BASE_URL}/v1/models",
+        headers={"Host": "localhost:11434"},
+        timeout=10,
+    )
+    assert resp.status_code == 200
+
+
+def test_127_host_header_allowed():
+    """127.0.0.1 Host header is accepted (#230)."""
+    resp = httpx.get(
+        f"{BASE_URL}/v1/models",
+        headers={"Host": "127.0.0.1:11434"},
+        timeout=10,
+    )
+    assert resp.status_code == 200
+
+
+def test_default_host_header_allowed():
+    """The default (httpx-set) Host header must pass - standing suite stays green."""
+    resp = httpx.get(f"{BASE_URL}/v1/models", timeout=10)
+    assert resp.status_code == 200
+
+
 # MARK: - Origin Check (default: localhost only)
 
 def test_no_origin_header_allowed():
@@ -328,6 +377,73 @@ def test_token_auto_prints_generated_secret():
     assert re.search(r"token: [0-9A-Fa-f-]{36}", banner)
 
 
+def test_no_origin_check_shows_loud_warning_without_cors():
+    """--no-origin-check alone must fire the loud multi-line warning (#232)."""
+    with running_server("--no-origin-check") as (_, log_path):
+        banner = read_log(log_path)
+    assert "WARNING" in banner
+    assert "Any website can access this server" in banner
+
+
+def test_footgun_still_shows_loud_warning():
+    """--footgun (no origin check + CORS) keeps the loud warning (#232 regression)."""
+    with running_server("--footgun") as (_, log_path):
+        banner = read_log(log_path)
+    assert "WARNING" in banner
+    assert "footgun" in banner
+    assert "Any website can access this server" in banner
+
+
+def test_default_server_has_no_origin_warning():
+    """Default (origin check on) must NOT print the loud warning (#232)."""
+    with running_server() as (_, log_path):
+        banner = read_log(log_path)
+    assert "Any website can access this server" not in banner
+
+
+def test_wildcard_allowed_origins_warns_like_no_origin_check():
+    """--allowed-origins '*' must fire the same warning as --no-origin-check (#465)."""
+    with running_server("--allowed-origins", "*") as (_, log_path):
+        banner = read_log(log_path)
+    assert "WARNING" in banner
+    assert "Any website can access this server" in banner
+    assert "localhost only" not in banner
+
+
+def test_normal_allowed_origins_shows_no_warning():
+    """--allowed-origins with a real origin must not fire the warning (#465)."""
+    with running_server("--allowed-origins", "http://localhost:5173") as (_, log_path):
+        banner = read_log(log_path)
+    assert "Any website can access this server" not in banner
+    assert "localhost only" in banner
+
+
+def test_non_loopback_bind_without_token_warns_loudly():
+    """0.0.0.0 with no token must fire a loud red banner pointing at --token (#228)."""
+    with running_server(bind_host="0.0.0.0") as (_, log_path):
+        banner = read_log(log_path)
+    assert "WARNING" in banner
+    assert "NO token" in banner
+    assert "--token" in banner
+    assert "docs/server-security.md" in banner
+
+
+def test_non_loopback_bind_with_token_has_no_exposure_warning():
+    """0.0.0.0 WITH a token must not print the exposed-without-token warning (#228)."""
+    with running_server(
+        "--token", "secret123", bind_host="0.0.0.0", ready_statuses=(401,)
+    ) as (_, log_path):
+        banner = read_log(log_path)
+    assert "NO token" not in banner
+
+
+def test_loopback_bind_without_token_has_no_exposure_warning():
+    """Default loopback bind without a token must not print the #228 warning."""
+    with running_server() as (_, log_path):
+        banner = read_log(log_path)
+    assert "NO token" not in banner
+
+
 def test_unauthorized_error_keeps_cors_for_allowed_origin():
     """Allowed browser origins must receive ACAO on 401 so auth failures are readable."""
     with running_server(
@@ -461,3 +577,148 @@ def test_default_preflight_still_works_without_cors():
     )
     assert resp.status_code == 204
     assert "access-control-allow-headers" not in resp.headers
+
+
+# ---------------------------------------------------------------------------
+# JSON nesting depth (#462)
+# ---------------------------------------------------------------------------
+
+
+def _nested(depth):
+    """`{"a": {"a": ... 1 ... }}` nested `depth` levels deep."""
+    import json as _json
+    return _json.loads('{"a":' * depth + "1" + "}" * depth)
+
+
+@pytest.mark.parametrize("depth", [200, 400])
+def test_deeply_nested_schema_is_rejected_not_fatal(depth):
+    """An over-nested caller schema must be a 400, never a dead process (#462).
+
+    AnyCodable recursed once per nesting level with no cap. Foundation's JSON
+    scanner only rejects at ~512 levels, far deeper than the stack of the
+    cooperative-pool thread the handler decodes on, so depths in between
+    exhausted the stack and aborted the whole process with SIGBUS. A ~1.3 KB
+    POST killed the server and every in-flight request with it -- and because
+    the crash happened during body decoding, before the handler ran, `--token`
+    did not protect against it.
+
+    Asserting 400 rather than merely "still alive" is deliberate: a bare depth
+    guard stops the crash but lets the `try?` container probes swallow the
+    error, answering 200 with the caller's schema silently truncated to null.
+    """
+    messages = [{"role": "user", "content": "hi"}]
+    bodies = {
+        "tools[].function.parameters": (
+            "/v1/chat/completions",
+            {"model": "apple-foundationmodel", "messages": messages,
+             "tools": [{"type": "function",
+                        "function": {"name": "t", "parameters": _nested(depth)}}]},
+        ),
+        "response_format.json_schema.schema": (
+            "/v1/chat/completions",
+            {"model": "apple-foundationmodel", "messages": messages,
+             "response_format": {"type": "json_schema",
+                                 "json_schema": {"name": "s", "schema": _nested(depth)}}},
+        ),
+        "text.format.schema": (
+            "/v1/responses",
+            {"model": "apple-foundationmodel", "input": "hi",
+             "text": {"format": {"type": "json_schema", "name": "s",
+                                 "schema": _nested(depth)}}},
+        ),
+    }
+
+    for field, (path, payload) in bodies.items():
+        resp = httpx.post(f"{BASE_URL}{path}", json=payload, timeout=30)
+        assert resp.status_code == 400, (
+            f"{field} at depth {depth} returned {resp.status_code}, expected 400. "
+            "A 200 here means the depth error was swallowed and the caller's "
+            "schema was silently truncated (#462)."
+        )
+        health = httpx.get(f"{BASE_URL}/health", timeout=10)
+        assert health.status_code == 200, (
+            f"server died after {field} at depth {depth} (#462)"
+        )
+
+
+@pytest.mark.model
+def test_realistic_nested_schema_still_accepted():
+    """The cap must not touch schemas anyone actually writes (#462)."""
+    resp = httpx.post(
+        f"{BASE_URL}/v1/chat/completions",
+        json={"model": "apple-foundationmodel", "messages": [{"role": "user", "content": "hi"}],
+              "tools": [{"type": "function", "function": {
+                  "name": "get_weather", "description": "Get weather",
+                  "parameters": {"type": "object", "properties": {"location": {
+                      "type": "object", "properties": {
+                          "city": {"type": "string"},
+                          "units": {"type": "string", "enum": ["c", "f"]}}}},
+                      "required": ["location"]}}}],
+              "max_tokens": 1},
+        timeout=120,
+    )
+    assert resp.status_code == 200, (
+        f"a 10-level-deep realistic schema was rejected: {resp.status_code} {resp.text[:300]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP idle timeout — stalled request body permit leak (#463)
+# ---------------------------------------------------------------------------
+
+IDLE_TIMEOUT_SECONDS = 30
+
+
+def test_stalled_request_bodies_do_not_wedge_the_server():
+    """A client that sends headers then stalls must not hold its permit (#463).
+
+    The route handler takes the concurrency permit before the body is read, and
+    the Application was built with no server channel configuration, so
+    HTTP1Channel's idleTimeout defaulted to nil -- no idle, read, or connection
+    timeout anywhere in the stack. `--max-concurrent` connections carrying
+    ~150 bytes each took the server out of service for as long as they were
+    held, and every legitimate request then blocked for the full 30-second
+    semaphore wait and returned 429.
+
+    This needs no attacker: a client that dies or loses its network mid-upload
+    leaked a permit until the OS reaped the half-open connection, so a
+    long-lived `brew services` server degraded on its own.
+
+    Model-free: it asserts permit accounting via /health, not generation.
+    """
+    max_concurrent = 2
+    with running_server("--max-concurrent", str(max_concurrent)) as (base_url, _):
+        port = int(base_url.rsplit(":", 1)[1])
+        socks = []
+        try:
+            for _ in range(max_concurrent):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect(("127.0.0.1", port))
+                s.sendall(
+                    b"POST /v1/chat/completions HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 5000\r\n"
+                    b"\r\n"
+                    b'{"model":"apple-foundationmodel","mess'
+                )
+                socks.append(s)
+
+            time.sleep(2)
+            held = httpx.get(f"{base_url}/health", timeout=10).json()
+            assert held["active_requests"] == max_concurrent, (
+                "precondition: the stalled connections should be holding every "
+                f"permit, got active_requests={held['active_requests']}"
+            )
+
+            time.sleep(IDLE_TIMEOUT_SECONDS + 6)
+
+            resp = httpx.get(f"{base_url}/health", timeout=10)
+            assert resp.status_code == 200
+            assert resp.json()["active_requests"] == 0, (
+                "permits were not released after the idle timeout; the server "
+                f"is still wedged: {resp.json()} (#463)"
+            )
+        finally:
+            for s in socks:
+                s.close()

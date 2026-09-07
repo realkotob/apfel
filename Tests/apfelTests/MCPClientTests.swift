@@ -38,6 +38,26 @@ func runMCPClientTests() {
         try assertEqual(args["a"] as! Int, 247)
     }
 
+    test("formatToolsCall falls back to empty object when arguments are invalid JSON") {
+        let msg = MCPProtocol.toolsCallRequest(id: 3, name: "multiply", arguments: "{not json}")
+        let data = msg.data(using: .utf8)!
+        let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let params = obj["params"] as! [String: Any]
+        let args = params["arguments"] as! [String: Any]
+        try assertEqual(args.count, 0)
+    }
+
+    test("formatToolsCall preserves JSON array arguments") {
+        let msg = MCPProtocol.toolsCallRequest(id: 3, name: "sum", arguments: "[1,2,3]")
+        let data = msg.data(using: .utf8)!
+        let obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let params = obj["params"] as! [String: Any]
+        let args = params["arguments"] as! [Any]
+        try assertEqual(args.count, 3)
+        try assertEqual(args[0] as? Int, 1)
+        try assertEqual(args[2] as? Int, 3)
+    }
+
     test("formatNotificationInitialized has no id") {
         let msg = MCPProtocol.initializedNotification()
         let data = msg.data(using: .utf8)!
@@ -55,6 +75,15 @@ func runMCPClientTests() {
         let info = try MCPProtocol.parseInitializeResponse(json)
         try assertEqual(info.name, "calc")
         try assertEqual(info.version, "1.0")
+    }
+
+    test("parseInitializeResponse defaults missing name and version to unknown") {
+        let json = """
+        {"jsonrpc":"2.0","id":1,"result":{"serverInfo":{}}}
+        """
+        let info = try MCPProtocol.parseInitializeResponse(json)
+        try assertEqual(info.name, "unknown")
+        try assertEqual(info.version, "unknown")
     }
 
     test("parseToolsListResponse extracts tool definitions") {
@@ -78,6 +107,15 @@ func runMCPClientTests() {
         try assertEqual(tools[1].function.name, "multiply")
     }
 
+    test("parseToolsListResponse drops nameless tool entries") {
+        let json = """
+        {"jsonrpc":"2.0","id":2,"result":{"tools":[{"description":"broken","inputSchema":{"type":"object","properties":{}}},{"name":"multiply","description":"Multiply","inputSchema":{"type":"object","properties":{}}}]}}
+        """
+        let tools = try MCPProtocol.parseToolsListResponse(json)
+        try assertEqual(tools.count, 1)
+        try assertEqual(tools[0].function.name, "multiply")
+    }
+
     test("parseToolCallResponse extracts text result") {
         let json = """
         {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"20501"}],"isError":false}}
@@ -85,6 +123,92 @@ func runMCPClientTests() {
         let result = try MCPProtocol.parseToolCallResponse(json)
         try assertEqual(result.text, "20501")
         try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse joins all text content blocks with newline (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}],"isError":false}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertEqual(result.text, "first\nsecond")
+        try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse extracts text blocks around non-text blocks (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"image","data":"aGk=","mimeType":"image/png"},{"type":"text","text":"caption"}],"isError":false}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertEqual(result.text, "caption")
+        try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse accepts an empty content array as an empty result (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[],"isError":false}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertEqual(result.text, "")
+        try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse accepts non-text-only content as an empty result (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"image","data":"aGk=","mimeType":"image/png"}]}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertEqual(result.text, "")
+        try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse falls back to structuredContent when no text blocks exist (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":{"temperature":22.5,"unit":"C"}}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertTrue(result.text.contains("\"temperature\""), "must serialize structuredContent: \(result.text)")
+        try assertTrue(result.text.contains("22.5"), "must serialize structuredContent values: \(result.text)")
+        try assertTrue(!result.isError)
+    }
+
+    test("parseToolCallResponse handles structuredContent-only results with no content key (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"ok":true}}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertTrue(result.text.contains("\"ok\""), "must serialize structuredContent: \(result.text)")
+    }
+
+    test("parseToolCallResponse prefers text blocks over structuredContent (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"22.5C"}],"structuredContent":{"temperature":22.5}}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertEqual(result.text, "22.5C")
+    }
+
+    test("parseToolCallResponse preserves isError on empty content (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{"content":[],"isError":true}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertTrue(result.isError)
+    }
+
+    test("parseToolCallResponse throws only when content and structuredContent are both missing (#242)") {
+        let json = """
+        {"jsonrpc":"2.0","id":3,"result":{}}
+        """
+        var thrown: MCPError?
+        do {
+            _ = try MCPProtocol.parseToolCallResponse(json)
+        } catch let e as MCPError {
+            thrown = e
+        }
+        guard case .invalidResponse(let message)? = thrown else {
+            throw TestFailure("expected MCPError.invalidResponse, got \(String(describing: thrown))")
+        }
+        try assertTrue(message.contains("content"), "message must name the missing field: \(message)")
     }
 
     test("parseToolCallResponse detects errors") {
@@ -103,6 +227,15 @@ func runMCPClientTests() {
         let result = try MCPProtocol.parseToolCallResponse(json)
         try assertTrue(result.isError)
         try assertTrue(result.text.contains("Unknown tool"))
+    }
+
+    test("parseToolCallResponse uses fallback text when JSON-RPC error omits message") {
+        let json = """
+        {"jsonrpc":"2.0","id":5,"error":{"code":-32603}}
+        """
+        let result = try MCPProtocol.parseToolCallResponse(json)
+        try assertTrue(result.isError)
+        try assertEqual(result.text, "Unknown MCP error")
     }
 
     // MARK: - Edge cases
@@ -209,5 +342,265 @@ func runMCPClientTests() {
         let instructions = ToolCallHandler.buildFallbackPrompt(tools: toolDefs)
         try assertTrue(instructions.contains("add"), "combined prompt must contain first tool")
         try assertTrue(instructions.contains("multiply"), "combined prompt must contain second tool")
+    }
+
+    // MARK: - Chat mode text-only tool instructions (#144)
+    // Native toolDefinitions can cause the framework to intercept tool calls,
+    // preventing text-based detection. Chat mode must use text-only instructions.
+
+    test("Chat text-only instructions include all schemas even when native conversion would succeed") {
+        // Reproduces the #144 scenario: tools that convert to native format just fine
+        // must STILL have their schemas available as text, because chat mode cannot
+        // rely on native toolDefinitions (the framework may intercept instead of
+        // producing text output that detectToolCall can parse).
+        let toolsJSON = """
+        {"jsonrpc":"2.0","id":2,"result":{"tools":[
+            {"name":"read","description":"Read a file","inputSchema":{"type":"object","properties":{"file":{"type":"string","description":"File path"}}}},
+            {"name":"edit","description":"Edit a file","inputSchema":{"type":"object","properties":{"file":{"type":"string"},"content":{"type":"string"}}}}
+        ]}}
+        """
+        let tools = try MCPProtocol.parseToolsListResponse(toolsJSON)
+        try assertEqual(tools.count, 2)
+
+        // Build text-only instructions (ALL tools as text, no native defs)
+        let allToolDefs = tools.map { ToolDef(name: $0.function.name, description: $0.function.description, parametersJSON: $0.function.parameters?.value) }
+        let fallbackPrompt = ToolCallHandler.buildFallbackPrompt(tools: allToolDefs)
+        let formatInstructions = ToolCallHandler.buildOutputFormatInstructions(toolNames: tools.map { $0.function.name })
+
+        // ALL tool schemas must be in the text
+        try assertTrue(fallbackPrompt.contains("read"), "text must contain 'read' tool schema")
+        try assertTrue(fallbackPrompt.contains("edit"), "text must contain 'edit' tool schema")
+        try assertTrue(fallbackPrompt.contains("file"), "text must contain parameter names")
+        try assertTrue(formatInstructions.contains("read"), "format must list 'read'")
+        try assertTrue(formatInstructions.contains("edit"), "format must list 'edit'")
+        try assertTrue(formatInstructions.contains("tool_calls"), "format must contain call format")
+    }
+
+    // MARK: - JSON-RPC id correlation (#217)
+    // sendAndReceive must keep reading until the response whose "id" matches
+    // the request id arrives: notifications (no id) and other-id responses are
+    // skipped, server "ping" requests are answered.
+
+    test("classifyIncoming matches the response with the awaited id") {
+        let line = #"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"42"}]}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .matchingResponse)
+    }
+
+    test("classifyIncoming skips a notification (method, no id)") {
+        let line = #"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"tool starting"}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming skips a response with a different id") {
+        let line = #"{"jsonrpc":"2.0","id":6,"result":{}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming skips an error response with a different id") {
+        let line = #"{"jsonrpc":"2.0","id":6,"error":{"code":-32603,"message":"boom"}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming matches an error response with the awaited id") {
+        let line = #"{"jsonrpc":"2.0","id":7,"error":{"code":-32603,"message":"boom"}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .matchingResponse)
+    }
+
+    test("classifyIncoming answers a server ping request, echoing its id") {
+        let line = #"{"jsonrpc":"2.0","id":9001,"method":"ping"}"#
+        guard case .pingRequest(let reply) = MCPProtocol.classifyIncoming(line, awaitingId: 7) else {
+            throw TestFailure("expected .pingRequest")
+        }
+        let obj = try JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
+        try assertEqual(obj["jsonrpc"] as! String, "2.0")
+        try assertEqual(obj["id"] as! Int, 9001)
+        try assertEqual((obj["result"] as! [String: Any]).count, 0)
+        try assertNil(obj["method"])
+    }
+
+    test("classifyIncoming answers a ping with a string id, echoing it verbatim") {
+        let line = #"{"jsonrpc":"2.0","id":"ping-1","method":"ping"}"#
+        guard case .pingRequest(let reply) = MCPProtocol.classifyIncoming(line, awaitingId: 7) else {
+            throw TestFailure("expected .pingRequest")
+        }
+        let obj = try JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
+        try assertEqual(obj["id"] as! String, "ping-1")
+    }
+
+    test("classifyIncoming skips a non-ping server request") {
+        let line = #"{"jsonrpc":"2.0","id":9002,"method":"roots/list"}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming skips stray non-JSON stdout noise") {
+        try assertEqual(MCPProtocol.classifyIncoming("INFO: server warming up", awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming matches a string-typed echo of the awaited id") {
+        let line = #"{"jsonrpc":"2.0","id":"7","result":{}}"#
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .matchingResponse)
+    }
+
+    test("classifyIncoming skips an id-less, method-less message") {
+        try assertEqual(MCPProtocol.classifyIncoming(#"{"jsonrpc":"2.0"}"#, awaitingId: 7), .unrelated)
+    }
+
+    // MARK: - Malformed model-emitted arguments must fail loudly (#241)
+    // The formatting fallback in toolsCallRequest silently replaced malformed
+    // JSON with {}; the call sites must validate first and throw a typed error.
+
+    test("validateToolArguments accepts a JSON object") {
+        try MCPProtocol.validateToolArguments(name: "multiply", arguments: "{\"a\":247,\"b\":83}")
+    }
+
+    test("validateToolArguments accepts a JSON array") {
+        try MCPProtocol.validateToolArguments(name: "sum", arguments: "[1,2,3]")
+    }
+
+    test("validateToolArguments accepts empty and whitespace-only arguments") {
+        try MCPProtocol.validateToolArguments(name: "list", arguments: "")
+        try MCPProtocol.validateToolArguments(name: "list", arguments: "  \n")
+    }
+
+    test("validateToolArguments throws typed invalidArguments on truncated JSON") {
+        var thrown: MCPError?
+        do {
+            try MCPProtocol.validateToolArguments(name: "get_weather", arguments: "{\"lat\": 48.2, \"lon\":")
+        } catch let e as MCPError {
+            thrown = e
+        }
+        guard case .invalidArguments(let message)? = thrown else {
+            throw TestFailure("expected MCPError.invalidArguments, got \(String(describing: thrown))")
+        }
+        try assertTrue(message.contains("get_weather"), "message must name the tool: \(message)")
+        try assertTrue(message.contains("not valid JSON"), "message must say the arguments are invalid: \(message)")
+        try assertTrue(message.contains("lat"), "message must include the offending arguments: \(message)")
+    }
+
+    test("validateToolArguments throws typed invalidArguments on unquoted-key JSON") {
+        var thrown: MCPError?
+        do {
+            try MCPProtocol.validateToolArguments(name: "multiply", arguments: "{a: 1, b: 2}")
+        } catch let e as MCPError {
+            thrown = e
+        }
+        guard case .invalidArguments = thrown else {
+            throw TestFailure("expected MCPError.invalidArguments, got \(String(describing: thrown))")
+        }
+    }
+
+    test("validateToolArguments rejects a bare scalar (not an object or array)") {
+        var thrown: MCPError?
+        do {
+            try MCPProtocol.validateToolArguments(name: "multiply", arguments: "42")
+        } catch let e as MCPError {
+            thrown = e
+        }
+        guard case .invalidArguments = thrown else {
+            throw TestFailure("expected MCPError.invalidArguments, got \(String(describing: thrown))")
+        }
+    }
+
+    test("MCPError.invalidArguments description carries the message") {
+        let err = MCPError.invalidArguments("Tool 'x' arguments are not valid JSON")
+        try assertEqual("\(err)", "Tool 'x' arguments are not valid JSON")
+    }
+
+    // MARK: - GCD dispatch for blocking stdio I/O (#431)
+    // Task.detached does not leave the cooperative pool; blocking I/O must
+    // run on a real GCD thread so it does not stall unrelated async work.
+
+    testAsync("GCD dispatch propagates tool call results (#431)") {
+        let result: String = try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: "tool-result-42")
+            }
+        }
+        try assertEqual(result, "tool-result-42")
+    }
+
+    testAsync("GCD dispatch propagates errors from blocking work (#431)") {
+        do {
+            let _: String = try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    continuation.resume(throwing: MCPError.timedOut("tool 'slow' timed out after 5s"))
+                }
+            }
+            throw TestFailure("expected error to propagate")
+        } catch let e as MCPError {
+            guard case .timedOut(let msg) = e else {
+                throw TestFailure("expected MCPError.timedOut, got \(e)")
+            }
+            try assertTrue(msg.contains("timed out"))
+        }
+    }
+
+    testAsync("concurrent async work is not blocked by GCD dispatch (#431)") {
+        let blockingWork = Task {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    Thread.sleep(forTimeInterval: 0.3)
+                    continuation.resume()
+                }
+            }
+        }
+
+        let start = Date()
+        let heartbeat = await Task { "alive" }.value
+        let elapsed = Date().timeIntervalSince(start)
+
+        try assertEqual(heartbeat, "alive")
+        try assertTrue(elapsed < 0.15, "cooperative task delayed \(elapsed)s by GCD-dispatched work")
+
+        try await blockingWork.value
+    }
+
+    test("Tool call detection works on object-argument format from #144 report") {
+        // The #144 reporter showed the model producing arguments as a JSON object
+        // (not an escaped string). Detection must handle both forms.
+        let modelOutput = #"{"tool_calls": [{"id": "call_001", "type": "function", "function": {"name": "read", "arguments": {"file": "CLAUDE.md"}}}]}"#
+        let calls = ToolCallHandler.detectToolCall(in: modelOutput)
+        try assertNotNil(calls, "tool calls must be detected with object arguments")
+        try assertEqual(calls!.count, 1)
+        try assertEqual(calls!.first?.name, "read")
+        try assertEqual(calls!.first?.id, "call_001")
+        try assertTrue(calls!.first!.argumentsString.contains("CLAUDE.md"), "arguments must contain the file path")
+    }
+
+    // MARK: - Oversized ping id rejection (#418)
+
+    test("classifyIncoming ignores a ping with an oversized string id (#418)") {
+        let bigId = String(repeating: "x", count: 262_144)
+        let json: [String: Any] = ["jsonrpc": "2.0", "id": bigId, "method": "ping"]
+        let data = try JSONSerialization.data(withJSONObject: json, options: [])
+        let line = String(data: data, encoding: .utf8)!
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming still echoes a ping with a 4096-byte string id (#418)") {
+        let okId = String(repeating: "a", count: 4096)
+        let json: [String: Any] = ["jsonrpc": "2.0", "id": okId, "method": "ping"]
+        let data = try JSONSerialization.data(withJSONObject: json, options: [])
+        let line = String(data: data, encoding: .utf8)!
+        guard case .pingRequest = MCPProtocol.classifyIncoming(line, awaitingId: 7) else {
+            throw TestFailure("expected .pingRequest for a 4096-byte id")
+        }
+    }
+
+    test("classifyIncoming ignores a ping with a 4097-byte string id (#418)") {
+        let bigId = String(repeating: "b", count: 4097)
+        let json: [String: Any] = ["jsonrpc": "2.0", "id": bigId, "method": "ping"]
+        let data = try JSONSerialization.data(withJSONObject: json, options: [])
+        let line = String(data: data, encoding: .utf8)!
+        try assertEqual(MCPProtocol.classifyIncoming(line, awaitingId: 7), .unrelated)
+    }
+
+    test("classifyIncoming still echoes a ping with a numeric id (#418)") {
+        let line = #"{"jsonrpc":"2.0","id":99999,"method":"ping"}"#
+        guard case .pingRequest(let reply) = MCPProtocol.classifyIncoming(line, awaitingId: 7) else {
+            throw TestFailure("expected .pingRequest for a numeric id")
+        }
+        let obj = try JSONSerialization.jsonObject(with: Data(reply.utf8)) as! [String: Any]
+        try assertEqual(obj["id"] as! Int, 99999)
     }
 }

@@ -73,12 +73,18 @@ func suite(_ name: String, _ block: () -> Void) {
 // MARK: - Run all test suites
 
 suite("ApfelErrorTests") { runApfelErrorTests() }
+suite("ExitCodeMapTests") { runExitCodeMapTests() }
 suite("ToolCallHandlerTests") { runToolCallHandlerTests() }
 suite("ContextStrategyTests") { runContextStrategyTests() }
 suite("OpenAIModelsTests") { runOpenAIModelsTests() }
+suite("JSONFenceStripperTests") { runJSONFenceStripperTests() }
+suite("CodeCropperTests") { runCodeCropperTests() }
 suite("ChatRequestValidatorTests") { runChatRequestValidatorTests() }
 suite("OriginValidatorTests") { runOriginValidatorTests() }
+suite("ServerSecurityTests") { runServerSecurityTests() }
 suite("MCPClientTests") { runMCPClientTests() }
+suite("MCPToolRegistryTests") { runMCPToolRegistryTests() }
+suite("ToolOutputTruncatorTests") { runToolOutputTruncatorTests() }
 suite("AsyncHarnessTests") { runAsyncHarnessTests() }
 suite("RetryTests") { runRetryTests() }
 suite("DebugLoggerTests") { runDebugLoggerTests() }
@@ -87,6 +93,45 @@ suite("CLIArgumentsTests") { runCLIArgumentsTests() }
 suite("ModelAvailabilityTests") { runModelAvailabilityTests() }
 suite("CLIErrorsTests") { runCLIErrorsTests() }
 suite("CLIValidateTests") { runCLIValidateTests() }
+suite("SchemaParserTests") { runSchemaParserTests() }
+suite("LRUCacheTests") { runLRUCacheTests() }
+suite("FinishReasonResolverTests") { runFinishReasonResolverTests() }
+suite("StreamErrorResolverTests") { runStreamErrorResolverTests() }
+suite("StreamingToolCallGateTests") { runStreamingToolCallGateTests() }
+suite("ToolResolutionTests") { runToolResolutionTests() }
+suite("BodyLimitsTests") { runBodyLimitsTests() }
+suite("TokenBudgetTests") { runTokenBudgetTests() }
+suite("TokenCountFallbackTests") { runTokenCountFallbackTests() }
+suite("CLIServerParityTests") { runCLIServerParityTests() }
+suite("TraceBufferTests") { runTraceBufferTests() }
+suite("StreamTaskBoxTests") { runStreamTaskBoxTests() }
+suite("ManPageTests") { runManPageTests() }
+suite("StreamCleanupTests") { runStreamCleanupTests() }
+suite("StreamPrintSinkTests") { runStreamPrintSinkTests() }
+suite("BrokenPipeTests") { runBrokenPipeTests() }
+suite("NestingDepthTests") { runNestingDepthTests() }
+suite("BufferedLineReaderConcurrencyTests") { runBufferedLineReaderConcurrencyTests() }
+suite("DebugFlagBaselineTests") { runDebugFlagBaselineTests() }
+suite("ApfelErrorMessageTests") { runApfelErrorMessageTests() }
+suite("OpenAIWireFormatTests") { runOpenAIWireFormatTests() }
+suite("SSEResponseHeadersTests") { runSSEResponseHeadersTests() }
+suite("ApfelCorePublicAPIUsageTests") { runApfelCorePublicAPIUsageTests() }
+suite("InstallMethodTests") { runInstallMethodTests() }
+suite("HomebrewPrefixTests") { runHomebrewPrefixTests() }
+suite("ColorPolicyTests") { runColorPolicyTests() }
+suite("SamplingDecisionTests") { runSamplingDecisionTests() }
+suite("DemoInstallerTests") { runDemoInstallerTests() }
+suite("FileFramingTests") { runFileFramingTests() }
+suite("RedTDDTests") { runRedTDDTests() }
+suite("AsyncSemaphoreTests") { runAsyncSemaphoreTests() }
+suite("ChatHistoryTests") { runChatHistoryTests() }
+suite("CompletionsTests") { runCompletionsTests() }
+suite("SchemaFlagTests") { runSchemaFlagTests() }
+suite("MessagesFlagTests") { runMessagesFlagTests() }
+suite("CodeFlagTests") { runCodeFlagTests() }
+suite("PrewarmDecisionTests") { runPrewarmDecisionTests() }
+suite("ResponsesModelsTests") { runResponsesModelsTests() }
+suite("ShellOutputTests") { runShellOutputTests() }
 
 // MARK: - Summary
 

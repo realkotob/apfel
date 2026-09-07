@@ -42,11 +42,81 @@ func runToolCallHandlerTests() {
         try assertNil(ToolCallHandler.detectToolCall(in: "{}"))
         try assertNil(ToolCallHandler.detectToolCall(in: "{\"tool_calls\": []}"))
     }
+
+    // MARK: - Unparseable tool-call salvage (#358)
+
+    test("salvages function name from unparseable tool-call JSON") {
+        // Live model output (macOS 26.5.2, seed 7): a literal
+        // <escaped_json_string> placeholder with unescaped nested quotes -
+        // invalid JSON that no candidate or bracket repair can parse. Without
+        // salvage this leaked verbatim to the client as message.content.
+        let response = #"{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "add", "arguments": {"<escaped_json_string>": "{"name": "100", "arguments": {"<escaped_json_string>": "200"}}}}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 1)
+        try assertEqual(result!.first?.name, "add")
+        // The salvaged arguments must NOT silently become valid JSON (like
+        // "{}") - the invalid-arguments recovery path (#241) must fire so the
+        // model sees a tool error, not a defaults execution.
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8))
+        try assertNil(parsed)
+    }
+    test("salvage does not fire on plain text mentioning tool_calls") {
+        try assertNil(ToolCallHandler.detectToolCall(in: "The tool_calls format uses JSON with a name field."))
+    }
+    test("salvage synthesizes an id and survives a preamble") {
+        let response = #"Let me add those. {"tool_calls": [{"function": {"name": "add", "arguments": {"x": "{"broken"}}]"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "add")
+        try assertTrue(result!.first!.id.hasPrefix("call_"))
+    }
+
+    // MARK: - stripToolCallJSON (#358)
+
+    test("stripToolCallJSON removes a balanced tool-call block") {
+        let text = #"Answer.{"tool_calls": [{"id": "x"}]} trailing"#
+        try assertEqual(ToolCallHandler.stripToolCallJSON(from: text), "Answer. trailing")
+    }
+    test("stripToolCallJSON strips an unbalanced tool-call attempt to end") {
+        // Unescaped quotes desync the brace scan - previously this returned
+        // the text unchanged, leaking the raw protocol JSON to the user.
+        let garbage = #"Sure! {"tool_calls": [{"id": "x", "function": {"name": "add", "arguments": {"a": "1"#
+        try assertEqual(ToolCallHandler.stripToolCallJSON(from: garbage), "Sure!")
+    }
+    test("stripToolCallJSON leaves text without a tool-call marker unchanged") {
+        try assertEqual(ToolCallHandler.stripToolCallJSON(from: "  plain answer  "), "plain answer")
+    }
     test("parses arguments JSON string correctly") {
         let response = #"{"tool_calls": [{"id": "c3", "type": "function", "function": {"name": "fn", "arguments": "{\"key\":\"val\"}"}}]}"#
         let result = ToolCallHandler.detectToolCall(in: response)
         try assertNotNil(result)
         try assertEqual(result!.first?.argumentsString, "{\"key\":\"val\"}")
+    }
+    test("parses function name string shape with sibling arguments") {
+        let response = #"{"tool_calls": [{"id": "call_unique1", "type": "function", "function": "get_current_conditions", "arguments": "{\"latitude\": 37.7749, \"longitude\": -122.4194}"}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "get_current_conditions")
+        try assertEqual(result!.first?.argumentsString, "{\"latitude\": 37.7749, \"longitude\": -122.4194}")
+    }
+    test("function name string shape without arguments defaults to empty object") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": "get_time"}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "get_time")
+        try assertEqual(result!.first?.argumentsString, "{}")
+    }
+    test("function name string shape with object sibling arguments serializes them") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": "add", "arguments": {"a": 1}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.argumentsString, "{\"a\":1}")
+    }
+    test("function that is neither dict nor string skips the call") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": 42}]}"#
+        try assertNil(ToolCallHandler.detectToolCall(in: response))
     }
     test("detects multiple tool calls") {
         let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fn1", "arguments": "{}"}}, {"id": "c2", "type": "function", "function": {"name": "fn2", "arguments": "{}"}}]}"#
@@ -76,6 +146,46 @@ func runToolCallHandlerTests() {
     }
 
     // MARK: - Edge cases (bug fixes)
+
+    test("detects tool call with missing closing bracket (#187)") {
+        let response = #"{"tool_calls": [{"id": "call_123", "type": "function", "function": {"name": "HassTurnOff", "arguments": {"entity_id": "office_light"}}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "HassTurnOff")
+        try assertEqual(result!.first?.id, "call_123")
+        try assertTrue(result!.first!.argumentsString.contains("office_light"))
+    }
+
+    test("detects tool call with missing bracket and string arguments (#187)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Vienna\"}"}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "get_weather")
+        try assertEqual(result!.first?.argumentsString, #"{"city":"Vienna"}"#)
+    }
+
+    test("detects tool call with missing bracket after preamble (#187)") {
+        let response = "Sure, I'll turn that off.\n" + #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "toggle", "arguments": "{}"}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "toggle")
+    }
+
+    test("detects multiple tool calls with missing bracket (#187)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fn1", "arguments": "{}"}}, {"id": "c2", "type": "function", "function": {"name": "fn2", "arguments": "{}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 2)
+    }
+
+    test("repairs missing bracket with multiple tool calls (#187)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fn1", "arguments": "{}"}}, {"id": "c2", "type": "function", "function": {"name": "fn2", "arguments": "{}"}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 2)
+        try assertEqual(result!.first?.name, "fn1")
+        try assertEqual(result!.last?.name, "fn2")
+    }
 
     test("handles trailing backticks without crash") {
         try assertNil(ToolCallHandler.detectToolCall(in: "```"))
@@ -155,6 +265,85 @@ func runToolCallHandlerTests() {
         try assertEqual(result!.first?.argumentsString, "{}")
     }
 
+    // MARK: - Scalar arguments do not crash (#388)
+
+    test("scalar number arguments do not crash and produce valid JSON (#388)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "add", "arguments": 7}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 1)
+        try assertEqual(result!.first?.name, "add")
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        try assertNotNil(parsed, "scalar number arguments must produce parseable JSON, got: \(args)")
+    }
+
+    test("scalar boolean arguments do not crash and produce valid JSON (#388)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "toggle", "arguments": true}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "toggle")
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        try assertNotNil(parsed, "scalar boolean arguments must produce parseable JSON, got: \(args)")
+    }
+
+    test("null arguments fall through to empty object (#388)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "ping", "arguments": null}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "ping")
+        try assertEqual(result!.first?.argumentsString, "{}")
+    }
+
+    test("object arguments unchanged after scalar fix (#388)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fn", "arguments": {"a": 1}}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        try assertNotNil(parsed)
+        try assertEqual(parsed?["a"] as? Int, 1)
+    }
+
+    test("string arguments unchanged after scalar fix (#388)") {
+        let response = #"{"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "fn", "arguments": "{\"key\":\"val\"}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.argumentsString, #"{"key":"val"}"#)
+    }
+
+    // MARK: - Synthesized id for calls missing "id" (#244)
+
+    test("synthesizes an id when the tool call omits \"id\" (#244)") {
+        // The on-device model routinely drops the id field. The whole call used
+        // to be treated as plain text and leaked to the user verbatim.
+        let response = #"{"tool_calls": [{"type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Vienna\"}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 1)
+        try assertEqual(result!.first?.name, "get_weather")
+        try assertTrue(result!.first!.id.hasPrefix("call_"), "synthesized id must start with call_, got \(result!.first!.id)")
+        try assertTrue(result!.first!.id.count > 5, "synthesized id must carry a suffix")
+    }
+
+    test("synthesizes an id when \"id\" is an empty string (#244)") {
+        let response = #"{"tool_calls": [{"id": "", "type": "function", "function": {"name": "fn", "arguments": "{}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertTrue(result!.first!.id.hasPrefix("call_"), "empty id must be replaced, got \(result!.first!.id)")
+    }
+
+    test("preserves a provided id and only synthesizes for the missing one (#244)") {
+        let response = #"{"tool_calls": [{"id": "call_keep", "type": "function", "function": {"name": "a", "arguments": "{}"}}, {"type": "function", "function": {"name": "b", "arguments": "{}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 2)
+        try assertEqual(result![0].id, "call_keep")
+        try assertTrue(result![1].id.hasPrefix("call_"), "second id must be synthesized")
+        try assertTrue(result![1].id != "call_keep", "synthesized id must be distinct")
+    }
+
     // MARK: - ensureJSONArguments (TICKET-013 fix)
 
     test("ensureJSONArguments passes through valid JSON object") {
@@ -209,6 +398,50 @@ func runToolCallHandlerTests() {
         let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         try assertNotNil(parsed)
         try assertEqual(parsed!["value"] as? String, "ls -l")
+    }
+
+    // MARK: - Argument recovery from unparseable tool calls (#367)
+
+    test("recovers balanced JSON arguments from unescaped-quote salvage (#367)") {
+        // Real model output: arguments as a quoted string with unescaped inner
+        // quotes plus the wrapper's trailing "}}]}". The inner object is valid
+        // JSON that salvage should recover.
+        let response = #"{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "multiply", "arguments": "{"value1": 1234, "value2": 5678}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.count, 1)
+        try assertEqual(result!.first?.name, "multiply")
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        try assertNotNil(parsed)
+        try assertEqual(parsed?["value1"] as? Int, 1234)
+        try assertEqual(parsed?["value2"] as? Int, 5678)
+    }
+
+    test("recovers arguments with different param names (#367)") {
+        // Second captured failure from the issue - same signature, different
+        // parameter names.
+        let response = #"{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "multiply", "arguments": "{"number1": 1234, "number2": 5678}"}}]}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "multiply")
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8)) as? [String: Any]
+        try assertNotNil(parsed)
+        try assertEqual(parsed?["number1"] as? Int, 1234)
+        try assertEqual(parsed?["number2"] as? Int, 5678)
+    }
+
+    test("non-recoverable salvage still fails loud (#367 respects #241)") {
+        // The existing #358 garbage-placeholder case: no valid JSON object
+        // to extract, so arguments must stay unparseable.
+        let response = #"{"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "add", "arguments": {"<escaped_json_string>": "{"name": "100", "arguments": {"<escaped_json_string>": "200"}}}}}}"#
+        let result = ToolCallHandler.detectToolCall(in: response)
+        try assertNotNil(result)
+        try assertEqual(result!.first?.name, "add")
+        let args = result!.first!.argumentsString
+        let parsed = try? JSONSerialization.jsonObject(with: Data(args.utf8))
+        try assertNil(parsed)
     }
 
     // MARK: - Split prompt methods
@@ -288,6 +521,48 @@ func runToolCallHandlerTests() {
         let a = ToolLogEntry(name: "add", args: "{}", result: "3", isError: false)
         let b = ToolLogEntry(name: "add", args: "{}", result: "3", isError: false)
         try assertEqual(a, b)
+    }
+
+    // MARK: - mcpRepromptCap (#435)
+
+    test("mcpRepromptCap is defined once and equals 3") {
+        try assertEqual(ToolCallHandler.mcpRepromptCap, 3)
+    }
+
+    // MARK: - ensureToolLoopCompleted (#435)
+
+    test("ensureToolLoopCompleted passes when content has no tool call") {
+        try ToolCallHandler.ensureToolLoopCompleted(in: "The answer is 42.")
+    }
+
+    test("ensureToolLoopCompleted passes for empty content") {
+        try ToolCallHandler.ensureToolLoopCompleted(in: "")
+    }
+
+    test("ensureToolLoopCompleted throws toolExecution when a tool call is pending") {
+        let pending = #"Here is what I found. {"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "add", "arguments": "{\"a\":1,\"b\":2}"}}]}"#
+        var thrown = false
+        do {
+            try ToolCallHandler.ensureToolLoopCompleted(in: pending)
+        } catch let e as ApfelError {
+            if case .toolExecution(let msg) = e {
+                thrown = true
+                try assertTrue(msg.contains("cap"), "message should mention the cap")
+                try assertTrue(msg.contains("pending"), "message should mention pending")
+            }
+        }
+        try assertTrue(thrown, "should have thrown ApfelError.toolExecution")
+    }
+
+    test("ensureToolLoopCompleted throws for unparseable tool-call JSON too") {
+        let broken = #"Sure! {"tool_calls": [{"id": "x", "function": {"name": "add", "arguments": {"a": "1"#
+        var thrown = false
+        do {
+            try ToolCallHandler.ensureToolLoopCompleted(in: broken)
+        } catch let e as ApfelError {
+            if case .toolExecution = e { thrown = true }
+        }
+        try assertTrue(thrown, "should throw for unparseable tool-call JSON")
     }
 
     // MARK: - ProcessPromptResult

@@ -39,7 +39,7 @@ func runBenchmarks() async throws {
     let report = try await benchmarkReport()
     switch outputFormat {
     case .json:
-        print(jsonString(report, pretty: false), terminator: "")
+        print(jsonString(report, pretty: false))
     case .plain:
         print("""
         \(styled("apfel", .cyan, .bold)) v\(report.version) — benchmark report
@@ -68,6 +68,7 @@ func runBenchmarks() async throws {
 private func benchmarkReport() async throws -> BenchmarkReport {
     let options = SessionOptions(
         temperature: 0.2,
+        topP: nil,
         maxTokens: 256,
         seed: 42,
         permissive: false,
@@ -84,7 +85,7 @@ private func benchmarkReport() async throws -> BenchmarkReport {
     let streamDebugCapture = await benchmarkStreamDebugCaptureDisabled()
     let contextManager = try await benchmarkContextManager(options: options)
     let requestPipeline = try await benchmarkRequestPipeline(options: options)
-    let requestDecode = await benchmarkRequestDecode()
+    let requestDecode = try await benchmarkRequestDecode()
     let toolDetection = await benchmarkToolDetection()
     let responseEncode = await benchmarkResponseEncode()
 
@@ -94,7 +95,11 @@ private func benchmarkReport() async throws -> BenchmarkReport {
         environment: BenchmarkEnvironment(
             model: modelName,
             context_window: await TokenCounter.shared.contextSize,
-            token_counter_available: await TokenCounter.shared.isAvailable
+            // Tokenizer availability, NOT generation availability: on macOS
+            // 26.0-26.3 with Apple Intelligence on, the model generates fine
+            // but every count in this report is chars/4 - the field must say
+            // so instead of repeating the pre-#315 lie on this surface (#325).
+            token_counter_available: await TokenCounter.shared.isTokenCountingAvailable
         ),
         benchmarks: [
             textExtraction,
@@ -234,8 +239,8 @@ private func benchmarkContextManager(options: SessionOptions) async throws -> Be
     let messages = benchmarkMessages()
 
     let iterations = 12
-    let timing = await measure(iterations: iterations) {
-        _ = try? await ContextManager.makeSession(
+    let timing = try await measure(iterations: iterations) {
+        _ = try await ContextManager.makeSession(
             messages: messages,
             tools: tools,
             options: options,
@@ -337,8 +342,8 @@ private func benchmarkRequestPipeline(options: SessionOptions) async throws -> B
     let validation = try await benchmarkRequestPipelineResult(request: request, options: options)
 
     let iterations = 40
-    let timing = await measure(iterations: iterations) {
-        _ = try? await benchmarkRequestPipelineResult(request: request, options: options)
+    let timing = try await measure(iterations: iterations) {
+        _ = try await benchmarkRequestPipelineResult(request: request, options: options)
     }
 
     return BenchmarkCaseResult(
@@ -352,11 +357,11 @@ private func benchmarkRequestPipeline(options: SessionOptions) async throws -> B
     )
 }
 
-private func benchmarkRequestDecode() async -> BenchmarkCaseResult {
+private func benchmarkRequestDecode() async throws -> BenchmarkCaseResult {
     let requestJSON = makeRequestJSON()
     let iterations = 500
-    let timing = await measure(iterations: iterations) {
-        _ = try? JSONDecoder().decode(ChatCompletionRequest.self, from: requestJSON)
+    let timing = try await measure(iterations: iterations) {
+        _ = try JSONDecoder().decode(ChatCompletionRequest.self, from: requestJSON)
     }
 
     return BenchmarkCaseResult(
@@ -428,18 +433,18 @@ private func benchmarkResponseEncode() async -> BenchmarkCaseResult {
 private func measure(
     iterations: Int,
     warmup: Int = 2,
-    operation: @escaping () async -> Void
-) async -> BenchmarkTiming {
+    operation: () async throws -> Void
+) async rethrows -> BenchmarkTiming {
     guard iterations > 0 else { return BenchmarkTiming(avgMilliseconds: 0) }
 
     for _ in 0..<warmup {
-        await operation()
+        try await operation()
     }
 
     var totalNanoseconds: UInt64 = 0
     for _ in 0..<iterations {
         let start = DispatchTime.now().uptimeNanoseconds
-        await operation()
+        try await operation()
         totalNanoseconds += DispatchTime.now().uptimeNanoseconds - start
     }
 
@@ -623,7 +628,7 @@ private func benchmarkRequestPipelineResult(
     request: ChatCompletionRequest,
     options: SessionOptions
 ) async throws -> (finalPrompt: String, promptTokens: Int, responseBytes: Int) {
-    let (session, finalPrompt) = try await ContextManager.makeSession(
+    let (_, finalPrompt, inputEntries) = try await ContextManager.makeSession(
         messages: request.messages,
         tools: request.tools,
         options: options,
@@ -631,7 +636,7 @@ private func benchmarkRequestPipelineResult(
         toolChoice: request.tool_choice
     )
     let promptTokens = await TokenCounter.shared.count(
-        entries: sessionInputEntries(session, finalPrompt: finalPrompt, options: options)
+        entries: sessionInputEntries(builtEntries: inputEntries, finalPrompt: finalPrompt, options: options)
     )
     let payload = ChatCompletionResponse(
         id: "chatcmpl-bench",

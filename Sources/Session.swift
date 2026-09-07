@@ -13,6 +13,7 @@ import ApfelCore
 /// Options forwarded from CLI flags or OpenAI request parameters.
 struct SessionOptions: Sendable {
     let temperature: Double?
+    let topP: Double?
     let maxTokens: Int?
     let seed: UInt64?
     let permissive: Bool
@@ -21,19 +22,35 @@ struct SessionOptions: Sendable {
     let retryCount: Int
 
     static let defaults = SessionOptions(
-        temperature: nil, maxTokens: nil, seed: nil, permissive: false,
+        temperature: nil, topP: nil, maxTokens: nil, seed: nil, permissive: false,
         contextConfig: .defaults, retryEnabled: false, retryCount: 3
     )
 }
 
 // MARK: - Generation Options
 
-func makeGenerationOptions(_ opts: SessionOptions) -> GenerationOptions {
-    let sampling: GenerationOptions.SamplingMode? = opts.seed.map {
-        .random(top: 50, seed: $0)
+/// Translate the pure `SamplingDecision` into the SDK's sampling mode.
+func makeSamplingMode(_ decision: SamplingDecision) -> GenerationOptions.SamplingMode? {
+    switch decision {
+    case .greedy:
+        return .greedy
+    case let .nucleus(probabilityThreshold, seed):
+        return .random(probabilityThreshold: probabilityThreshold, seed: seed)
+    case let .topK(top, seed):
+        return .random(top: top, seed: seed)
+    case .defaultMode:
+        return nil
     }
+}
+
+func makeGenerationOptions(_ opts: SessionOptions) -> GenerationOptions {
+    let decision = SamplingDecision.resolve(
+        temperature: opts.temperature,
+        topP: opts.topP,
+        seed: opts.seed
+    )
     return GenerationOptions(
-        sampling: sampling,
+        sampling: makeSamplingMode(decision),
         temperature: opts.temperature,
         maximumResponseTokens: opts.maxTokens
     )
@@ -81,12 +98,17 @@ func transcriptEntries(_ transcript: Transcript) -> [Transcript.Entry] {
     Array(transcript)
 }
 
+/// Assemble the full prompt-token accounting input from the entries
+/// ContextManager actually built (which retain native tool definitions) plus
+/// the final prompt sent via respond(). Reading the entries back from
+/// `session.transcript` instead drops `Instructions.toolDefinitions`, which
+/// undercounts prompt tokens for tool-augmented requests (#176).
 func sessionInputEntries(
-    _ session: LanguageModelSession,
+    builtEntries: [Transcript.Entry],
     finalPrompt: String,
     options: SessionOptions = .defaults
 ) -> [Transcript.Entry] {
-    var entries = transcriptEntries(session.transcript)
+    var entries = builtEntries
     entries.append(makePromptEntry(finalPrompt, options: options))
     return entries
 }
@@ -167,10 +189,15 @@ func trimHistoryEntriesToBudget(
             base: baseEntries, history: historyEntries, final: finalEntry, budget: budget,
             permissive: config.permissive)
     case .strict:
-        // No trimming — return all history or nil if it exceeds budget
+        // No trimming — return all history or nil if it exceeds budget.
+        // The final entry is included for the budget CHECK only; like every
+        // other strategy the returned entries must NOT contain it, because
+        // callers send the final prompt separately via respond(). Including
+        // it here made the model see the prompt twice and double-counted it
+        // in prompt_tokens.
         let all = assembleTranscriptEntries(base: baseEntries, history: historyEntries, final: finalEntry)
         return await fitsTranscriptBudget(all, budget: budget)
-            ? all
+            ? assembleTranscriptEntries(base: baseEntries, history: historyEntries)
             : nil
     }
 }
@@ -238,18 +265,21 @@ func processPrompt(
     debugLog("prompt", "stream=\(stream) retry=\(retryMax) mcp=\(hasMCPTools)")
 
     var content: String
-    if stream {
-        content = try await withRetry(maxRetries: retryMax) {
-            try await collectStream(session, prompt: prompt, printDelta: printDelta && !hasMCPTools, options: genOpts)
-        }
-    } else {
-        content = try await withRetry(maxRetries: retryMax) {
-            let response = try await session.respond(to: prompt, options: genOpts)
-            return response.content
-        }
+    var finishReason: FinishReason = .stop
+    // Print deltas only on the live streaming path with no MCP tools (tool calls
+    // re-prompt and stream the final answer separately). Share ONE print sink
+    // across all retry attempts: a retryable mid-stream error re-runs the stream
+    // from an empty snapshot, and the sink suppresses re-emitting the already-
+    // printed prefix so output appears exactly once, live, in order (#182).
+    let shouldPrint = stream && printDelta && !hasMCPTools
+    let printSink = shouldPrint ? StreamPrintSink() : nil
+    let outcome = try await withRetry(maxRetries: retryMax) {
+        try await collectStream(session, prompt: prompt, sink: printSink, options: genOpts)
     }
+    content = outcome.content
+    finishReason = outcome.finishReason
 
-    debugLog("response", "length=\(content.count)")
+    debugLog("response", "length=\(content.count) finish=\(finishReason)")
 
     var toolLog: [ToolLogEntry] = []
     if let result = try await executeMCPToolCallsForCLI(
@@ -259,9 +289,11 @@ func processPrompt(
         content = result.content
         toolLog = result.toolLog.map { ToolLogEntry(name: $0.name, args: $0.args, result: $0.result, isError: $0.isError) }
         debugLog("mcp", "executed \(toolLog.count) tool calls")
+        // After tool re-prompt the model produced a fresh natural reply.
+        finishReason = .stop
     }
 
-    return ProcessPromptResult(content: content, toolLog: toolLog)
+    return ProcessPromptResult(content: content, toolLog: toolLog, finishReason: finishReason)
 }
 
 /// Print tool execution log entries to stderr.
@@ -269,9 +301,9 @@ func printToolLog(_ toolLog: [ToolLogEntry]) {
     guard !quietMode else { return }
     for log in toolLog {
         if log.isError {
-            printStderr("\(styled("tool:", .red)) \(log.name) failed: \(log.result)")
+            printStderr("\(styledErr("tool:", .red)) \(log.name) failed: \(log.result)")
         } else {
-            printStderr("\(styled("tool:", .cyan)) \(log.name)(\(log.args)) = \(log.result)")
+            printStderr("\(styledErr("tool:", .cyan)) \(log.name)(\(log.args)) = \(log.result)")
         }
     }
 }
@@ -302,20 +334,55 @@ func detectAndExecuteMCPTools(
     for call in toolCalls {
         do {
             let result = try await mcpManager.execute(name: call.name, arguments: call.argumentsString)
-            resultParts.append("\(call.name): \(result)")
-            toolLog.append((name: call.name, args: call.argumentsString, result: result, isError: false))
+            if result.isError {
+                // An MCP-spec `isError: true` result is a tool-execution error
+                // (e.g. divide(1,0)). Feed it back to the model so it can see
+                // the error and recover, instead of aborting with HTTP 500 (#220).
+                resultParts.append("\(call.name): error - \(result.text)")
+                toolLog.append((name: call.name, args: call.argumentsString, result: result.text, isError: true))
+            } else {
+                resultParts.append("\(call.name): \(result.text)")
+                toolLog.append((name: call.name, args: call.argumentsString, result: result.text, isError: false))
+            }
         } catch {
-            if case .toolNotFound = error as? MCPError {
+            switch error as? MCPError {
+            // Non-fatal per-call failures: feed them back as an error result so
+            // the model can retry (unknown tool, or malformed model-emitted
+            // arguments (#241)) instead of aborting the whole request.
+            case .toolNotFound, .invalidArguments:
                 let msg = "\(error)"
                 resultParts.append("\(call.name): error - \(msg)")
                 toolLog.append((name: call.name, args: call.argumentsString, result: msg, isError: true))
-            } else {
+            default:
                 throw error
             }
         }
     }
 
     return MCPExecutionResult(toolCalls: toolCalls, resultParts: resultParts, toolLog: toolLog)
+}
+
+/// The fixed CLI follow-up prompt template with an empty tool result, used to
+/// price the prompt overhead so the tool result gets the remaining token budget.
+private func cliFollowUpOverhead(userPrompt: String, systemPrompt: String?) -> String {
+    (systemPrompt ?? "")
+        + "The user asked: \(userPrompt)\n\nThe tool returned: \n\nAnswer the user's question using this result."
+}
+
+/// Truncate a tool-result string to a token budget derived from the model's
+/// context window minus the fixed prompt overhead and an output reserve, so a
+/// large tool result cannot overflow the context (CLI) or be dropped whole by
+/// the context trimmer while the prompt still references it (server) (#221).
+func truncateToolResultToBudget(
+    _ result: String,
+    overhead: String,
+    outputReserve: Int = 512
+) async -> String {
+    let inputBudget = await TokenCounter.shared.inputBudget(reservedForOutput: outputReserve)
+    let overheadTokens = await TokenCounter.shared.count(overhead)
+    let budget = max(0, inputBudget - overheadTokens)
+    let tokens = await TokenCounter.shared.count(result)
+    return ToolOutputTruncator.truncate(result, tokenCount: tokens, budgetTokens: budget).text
 }
 
 /// CLI path: execute MCP tool calls and re-prompt with a plain follow-up session.
@@ -331,17 +398,71 @@ func executeMCPToolCallsForCLI(
         return nil
     }
 
+    var aggregatedLog = executed.toolLog
     let plainSession = makeSession(systemPrompt: systemPrompt)
-    let toolResult = executed.resultParts.joined(separator: "\n")
-    let finalContent = try await plainSession.respond(
+    let overhead = cliFollowUpOverhead(userPrompt: userPrompt, systemPrompt: systemPrompt)
+    var toolResult = await truncateToolResultToBudget(
+        executed.resultParts.joined(separator: "\n"), overhead: overhead)
+    var finalContent = try await plainSession.respond(
         to: "The user asked: \(userPrompt)\n\nThe tool returned: \(toolResult)\n\nAnswer the user's question using this result.",
         options: options
     ).content
-    return (content: finalContent, toolLog: executed.toolLog)
+
+    // The re-prompt answer may itself contain another tool_calls request. If we
+    // returned it verbatim that JSON would leak to the user as raw text. Run a
+    // bounded re-detection loop: execute any further tool calls and re-prompt
+    // again, with a hard cap so a model that keeps emitting tool_calls cannot
+    // spin forever.
+    var reprompts = 0
+    while reprompts < ToolCallHandler.mcpRepromptCap,
+          let followUp = try await detectAndExecuteMCPTools(in: finalContent, mcpManager: mcpManager) {
+        reprompts += 1
+        aggregatedLog.append(contentsOf: followUp.toolLog)
+        toolResult = await truncateToolResultToBudget(
+            followUp.resultParts.joined(separator: "\n"), overhead: overhead)
+        finalContent = try await plainSession.respond(
+            to: "The user asked: \(userPrompt)\n\nThe tool returned: \(toolResult)\n\nAnswer the user's question using this result.",
+            options: options
+        ).content
+    }
+
+    // Cap exhausted but the model is still emitting a tool call: fail loudly
+    // instead of stripping the JSON and returning a fragment as success (#435).
+    try ToolCallHandler.ensureToolLoopCompleted(in: finalContent)
+
+    return (content: finalContent, toolLog: aggregatedLog)
+}
+
+/// Token-budget each executed tool result for a server follow-up, given the
+/// prior conversation, so no single `role: "tool"` message exceeds the context
+/// budget and gets dropped whole by the trimmer (#221). The returned toolLog is
+/// left full elsewhere; only the prompt-bound copy is truncated.
+private func truncatedServerToolResults(
+    toolLog: [(name: String, args: String, result: String, isError: Bool)],
+    priorMessages: [OpenAIMessage]
+) async -> [(name: String, result: String)] {
+    let inputBudget = await TokenCounter.shared.inputBudget(reservedForOutput: 512)
+    let conversationText = priorMessages.compactMap { $0.textContent }.joined(separator: "\n")
+    let overheadTokens = await TokenCounter.shared.count(conversationText)
+    let perResultBudget = max(0, inputBudget - overheadTokens) / max(1, toolLog.count)
+    var out: [(name: String, result: String)] = []
+    for entry in toolLog {
+        let tokens = await TokenCounter.shared.count(entry.result)
+        let text = ToolOutputTruncator.truncate(
+            entry.result, tokenCount: tokens, budgetTokens: perResultBudget).text
+        out.append((name: entry.name, result: text))
+    }
+    return out
 }
 
 /// Server path: execute MCP tool calls and re-prompt with full conversation context.
 /// Appends tool call/result messages to the conversation and rebuilds a session via ContextManager.
+///
+/// Runs the same bounded re-detection loop as the CLI path (#240): if the model
+/// answers the tool-result follow-up with another `{"tool_calls": ...}` (common
+/// in tool chains), that round is executed and re-prompted, up to `maxReprompts`.
+/// On cap exhaustion any trailing tool-call JSON is stripped so it never leaks to
+/// the HTTP client as `message.content` with `finish_reason: "stop"`.
 func executeMCPToolCallsForServer(
     in content: String,
     mcpManager: MCPManager?,
@@ -354,20 +475,49 @@ func executeMCPToolCallsForServer(
         return nil
     }
 
-    let followUpMessages = appendExecutedToolResults(
-        to: messages,
-        toolCalls: executed.toolCalls,
-        toolResults: executed.toolLog.map { ($0.name, $0.result) }
-    )
-    let (followUpSession, followUpPrompt) = try await ContextManager.makeSession(
-        messages: followUpMessages,
-        tools: nil,
-        options: sessionOptions,
-        jsonMode: false,
-        toolChoice: nil
-    )
-    let finalContent = try await followUpSession.respond(to: followUpPrompt, options: options).content
-    return (content: finalContent, toolLog: executed.toolLog)
+    var aggregatedLog = executed.toolLog
+    var currentMessages = messages
+    var currentExecuted = executed
+    var finalContent = ""
+
+    // Mirror the CLI path's bounded loop: initial re-prompt plus up to
+    // mcpRepromptCap further rounds when the model keeps emitting tool calls.
+    var reprompts = 0
+    while true {
+        let truncated = await truncatedServerToolResults(
+            toolLog: currentExecuted.toolLog, priorMessages: currentMessages)
+        let followUpMessages = appendExecutedToolResults(
+            to: currentMessages,
+            toolCalls: currentExecuted.toolCalls,
+            toolResults: truncated
+        )
+        let (followUpSession, followUpPrompt, _) = try await ContextManager.makeSession(
+            messages: followUpMessages,
+            tools: nil,
+            options: sessionOptions,
+            jsonMode: false,
+            toolChoice: nil
+        )
+        finalContent = try await followUpSession.respond(to: followUpPrompt, options: options).content
+
+        // The re-prompt answer may itself request another tool call. Execute and
+        // re-prompt again with a hard cap so a model that keeps emitting
+        // tool_calls cannot spin forever.
+        guard reprompts < ToolCallHandler.mcpRepromptCap,
+              let next = try await detectAndExecuteMCPTools(in: finalContent, mcpManager: mcpManager) else {
+            break
+        }
+        reprompts += 1
+        aggregatedLog.append(contentsOf: next.toolLog)
+        currentMessages = followUpMessages
+        currentExecuted = next
+    }
+
+    // Cap exhausted but the model is still emitting a tool call: fail loudly
+    // instead of stripping the JSON and returning a fragment as success (#435).
+    try ToolCallHandler.ensureToolLoopCompleted(in: finalContent)
+
+    return (content: finalContent, toolLog: aggregatedLog)
 }
 
 private func appendExecutedToolResults(
@@ -402,28 +552,52 @@ private func appendExecutedToolResults(
 
 /// Stream a response, optionally printing deltas to stdout.
 /// FoundationModels returns cumulative snapshots; we compute deltas by tracking prev length.
-/// - Returns: The complete response text after all chunks have been received.
+///
+/// Resolves `finishReason` two ways:
+///   - Natural stream completion: `.length` if `completionTokens >= maxTokens`,
+///     else `.stop`. Tool-call detection happens at higher layers.
+///   - Output-side context overflow (model ran into the 4096-token ceiling
+///     after producing content): graceful `.length`. Prompt-side overflow
+///     (no content produced before the throw) still throws.
+///
+/// - Returns: A `StreamOutcome` carrying the accumulated content and the
+///   resolved finish reason.
 func collectStream(
     _ session: LanguageModelSession,
     prompt: String,
-    printDelta: Bool,
+    sink: StreamPrintSink? = nil,
     options: GenerationOptions = GenerationOptions()
-) async throws -> String {
+) async throws -> StreamOutcome {
     let stream = session.streamResponse(to: prompt, options: options)
     var prev = ""
-    for try await snapshot in stream {
-        let content = snapshot.content
-        if content.count > prev.count {
-            let idx = content.index(content.startIndex, offsetBy: prev.count)
-            let delta = String(content[idx...])
-            if printDelta {
-                print(delta, terminator: "")
-                fflush(stdout)
+    do {
+        for try await snapshot in stream {
+            let content = snapshot.content
+            // Feed the cumulative snapshot to the (optional) print sink. The sink
+            // tracks a high-water mark across retries and emits only the suffix
+            // beyond what it has already printed, so a retried re-run never
+            // reprints the already-streamed prefix (#182).
+            if let sink {
+                await sink.feed(cumulative: content)
             }
+            prev = content
         }
-        prev = content
+        let completionTokens = await TokenCounter.shared.count(prev)
+        let reason = FinishReasonResolver.resolve(
+            hasToolCalls: false,
+            completionTokens: completionTokens,
+            maxTokens: options.maximumResponseTokens
+        )
+        return StreamOutcome(content: prev, finishReason: reason)
+    } catch {
+        let classified = ApfelError.classify(error)
+        switch StreamErrorResolver.resolve(prev: prev, error: classified) {
+        case .truncated(let content):
+            return StreamOutcome(content: content, finishReason: .length)
+        case .fatal(let err):
+            throw err
+        }
     }
-    return prev
 }
 
 func maxNewestHistoryCountThatFits(
